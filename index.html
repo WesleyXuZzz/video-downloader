@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>视频下载器</title>
+    <style>
+      :root {
+        color: #18211f;
+        background: #f5f5f5;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+      }
+
+      body {
+        margin: 0;
+        background: #f5f5f5;
+      }
+
+      .boot-screen {
+        display: grid;
+        min-height: 100vh;
+        place-items: center;
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(245, 245, 245, 0)),
+          #f5f5f5;
+      }
+
+      .boot-panel {
+        display: grid;
+        width: min(360px, calc(100vw - 48px));
+        gap: 18px;
+        justify-items: center;
+        padding: 28px;
+        color: #18211f;
+      }
+
+      .boot-mark {
+        display: grid;
+        width: 54px;
+        height: 54px;
+        place-items: center;
+        color: #ffffff;
+        background: #1677ff;
+        border-radius: 8px;
+        box-shadow: 0 16px 34px rgba(22, 119, 255, 0.24);
+      }
+
+      .boot-mark svg {
+        width: 30px;
+        height: 30px;
+      }
+
+      .boot-copy {
+        display: grid;
+        gap: 6px;
+        justify-items: center;
+        text-align: center;
+      }
+
+      .boot-title {
+        margin: 0;
+        font-size: 22px;
+        font-weight: 760;
+        line-height: 1.15;
+      }
+
+      .boot-subtitle {
+        margin: 0;
+        color: #66736e;
+        font-size: 13px;
+      }
+
+      .boot-progress {
+        position: relative;
+        width: min(280px, 100%);
+        height: 8px;
+        overflow: hidden;
+        background: #d9e1dc;
+        border-radius: 999px;
+      }
+
+      .boot-progress::before {
+        position: absolute;
+        inset: 0;
+        width: 46%;
+        border-radius: inherit;
+        background:
+          linear-gradient(90deg, rgba(22, 119, 255, 0), #1677ff 42%, #69b1ff 100%);
+        animation: boot-progress-slide 1.18s ease-in-out infinite;
+        content: "";
+      }
+
+      .boot-ticks {
+        display: grid;
+        grid-template-columns: repeat(5, 6px);
+        gap: 8px;
+        justify-content: center;
+      }
+
+      .boot-tick {
+        width: 6px;
+        height: 6px;
+        background: #1677ff;
+        border-radius: 999px;
+        opacity: 0.24;
+        animation: boot-tick-pulse 1.18s ease-in-out infinite;
+      }
+
+      .boot-tick:nth-child(2) {
+        animation-delay: 0.12s;
+      }
+
+      .boot-tick:nth-child(3) {
+        animation-delay: 0.24s;
+      }
+
+      .boot-tick:nth-child(4) {
+        animation-delay: 0.36s;
+      }
+
+      .boot-tick:nth-child(5) {
+        animation-delay: 0.48s;
+      }
+
+      @keyframes boot-progress-slide {
+        0% {
+          transform: translateX(-105%);
+        }
+
+        100% {
+          transform: translateX(225%);
+        }
+      }
+
+      @keyframes boot-tick-pulse {
+        0%,
+        100% {
+          opacity: 0.22;
+          transform: translateY(0);
+        }
+
+        45% {
+          opacity: 0.9;
+          transform: translateY(-2px);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .boot-progress::before,
+        .boot-tick {
+          animation: none;
+        }
+
+        .boot-progress::before {
+          transform: translateX(65%);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div class="boot-screen" role="status" aria-live="polite">
+        <div class="boot-panel">
+          <div class="boot-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none">
+              <path
+                d="M12 4v10m0 0 4-4m-4 4-4-4"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+              <path
+                d="M5 17.5h14"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+              />
+              <path
+                d="M6.5 6.5h2M15.5 6.5h2M6.5 10.5h2M15.5 10.5h2"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                opacity="0.72"
+              />
+            </svg>
+          </div>
+          <div class="boot-copy">
+            <h1 class="boot-title">视频下载器</h1>
+            <p class="boot-subtitle">准备下载环境</p>
+          </div>
+          <div class="boot-progress" aria-hidden="true"></div>
+          <div class="boot-ticks" aria-hidden="true">
+            <span class="boot-tick"></span>
+            <span class="boot-tick"></span>
+            <span class="boot-tick"></span>
+            <span class="boot-tick"></span>
+            <span class="boot-tick"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
