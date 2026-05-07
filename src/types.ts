@@ -144,6 +144,19 @@ export interface FfmpegCommandDraft {
   outputPath: string;
 }
 
+export interface FfmpegCommandHistoryItem extends FfmpegCommandRequest {
+  id: string;
+  command: string;
+  workingDir: string;
+  outputPath: string;
+  createdAt: string;
+}
+
+export type FfmpegCommandHistoryInput = Omit<
+  FfmpegCommandHistoryItem,
+  "id" | "createdAt"
+>;
+
 export interface TerminalPrefillResult {
   prefilled: boolean;
   message: string;

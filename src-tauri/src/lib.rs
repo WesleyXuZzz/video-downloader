@@ -24,6 +24,7 @@ static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct AppState {
     tasks: Mutex<HashMap<String, TaskControl>>,
     history_lock: Mutex<()>,
+    ffmpeg_command_history_lock: Mutex<()>,
     tool_settings_lock: Mutex<()>,
 }
 
@@ -215,6 +216,40 @@ struct FfmpegCommandRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FfmpegCommandDraft {
+    command: String,
+    working_dir: String,
+    output_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FfmpegCommandHistoryItem {
+    id: String,
+    preset_id: String,
+    input_path: String,
+    secondary_input_path: Option<String>,
+    output_dir: String,
+    audio_format: Option<String>,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    crf: Option<u8>,
+    command: String,
+    working_dir: String,
+    output_path: String,
+    created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FfmpegCommandHistoryInput {
+    preset_id: String,
+    input_path: String,
+    secondary_input_path: Option<String>,
+    output_dir: String,
+    audio_format: Option<String>,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    crf: Option<u8>,
     command: String,
     working_dir: String,
     output_path: String,
@@ -480,13 +515,7 @@ async fn parse_download_queue(
             }
             source_order += 1;
 
-            match parse_queue_url(
-                &state,
-                &yt_dlp_path,
-                &url,
-                browser.as_deref(),
-                source_order,
-            ) {
+            match parse_queue_url(&state, &yt_dlp_path, &url, browser.as_deref(), source_order) {
                 Ok(mut parsed) => items.append(&mut parsed),
                 Err(error) => items.push(BatchParseItem {
                     id: uuid_like_id(),
@@ -881,6 +910,54 @@ async fn build_ffmpeg_command(
 }
 
 #[tauri::command]
+async fn load_ffmpeg_command_history(
+    app: AppHandle,
+) -> Result<Vec<FfmpegCommandHistoryItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        read_ffmpeg_command_history(&state)
+    })
+    .await
+    .map_err(|error| format!("读取 FFmpeg 命令历史失败：{error}"))?
+}
+
+#[tauri::command]
+async fn append_ffmpeg_command_history(
+    app: AppHandle,
+    item: FfmpegCommandHistoryInput,
+) -> Result<Vec<FfmpegCommandHistoryItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        append_ffmpeg_command_history_item(&state, item)
+    })
+    .await
+    .map_err(|error| format!("保存 FFmpeg 命令历史失败：{error}"))?
+}
+
+#[tauri::command]
+async fn delete_ffmpeg_command_history_items(
+    app: AppHandle,
+    ids: Vec<String>,
+) -> Result<Vec<FfmpegCommandHistoryItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        delete_ffmpeg_command_history_by_ids(&state, &ids)
+    })
+    .await
+    .map_err(|error| format!("删除 FFmpeg 命令历史失败：{error}"))?
+}
+
+#[tauri::command]
+async fn clear_ffmpeg_command_history(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        clear_ffmpeg_command_history_items(&state)
+    })
+    .await
+    .map_err(|error| format!("清空 FFmpeg 命令历史失败：{error}"))?
+}
+
+#[tauri::command]
 async fn prefill_terminal_command(
     command: String,
     working_dir: String,
@@ -955,6 +1032,10 @@ pub fn run() {
             load_history,
             delete_history_item,
             build_ffmpeg_command,
+            load_ffmpeg_command_history,
+            append_ffmpeg_command_history,
+            delete_ffmpeg_command_history_items,
+            clear_ffmpeg_command_history,
             prefill_terminal_command
         ])
         .run(tauri::generate_context!())
@@ -2142,6 +2223,10 @@ fn history_path() -> Result<PathBuf, String> {
     Ok(app_data_dir()?.join("history.json"))
 }
 
+fn ffmpeg_command_history_path() -> Result<PathBuf, String> {
+    Ok(app_data_dir()?.join("ffmpeg-command-history.json"))
+}
+
 fn tool_settings_path() -> Result<PathBuf, String> {
     Ok(app_data_dir()?.join("tool-settings.json"))
 }
@@ -2213,6 +2298,109 @@ fn write_history_unlocked(items: &[HistoryItem]) -> Result<(), String> {
     let bytes =
         serde_json::to_vec_pretty(items).map_err(|error| format!("序列化历史记录失败：{error}"))?;
     fs::write(&path, bytes).map_err(|error| format!("写入历史记录失败 {}：{error}", path.display()))
+}
+
+fn read_ffmpeg_command_history(state: &AppState) -> Result<Vec<FfmpegCommandHistoryItem>, String> {
+    let _guard = state
+        .ffmpeg_command_history_lock
+        .lock()
+        .map_err(|_| "FFmpeg 命令历史记录锁已损坏。".to_string())?;
+    let mut items = read_ffmpeg_command_history_unlocked()?;
+    sort_ffmpeg_command_history(&mut items);
+    Ok(items)
+}
+
+fn read_ffmpeg_command_history_unlocked() -> Result<Vec<FfmpegCommandHistoryItem>, String> {
+    let path = ffmpeg_command_history_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let bytes = fs::read(&path)
+        .map_err(|error| format!("读取 FFmpeg 命令历史失败 {}：{error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("解析 FFmpeg 命令历史失败 {}：{error}", path.display()))
+}
+
+fn write_ffmpeg_command_history_unlocked(items: &[FfmpegCommandHistoryItem]) -> Result<(), String> {
+    let path = ffmpeg_command_history_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("创建 FFmpeg 命令历史目录失败 {}：{error}", parent.display())
+        })?;
+    }
+
+    let bytes = serde_json::to_vec_pretty(items)
+        .map_err(|error| format!("序列化 FFmpeg 命令历史失败：{error}"))?;
+    fs::write(&path, bytes)
+        .map_err(|error| format!("写入 FFmpeg 命令历史失败 {}：{error}", path.display()))
+}
+
+fn append_ffmpeg_command_history_item(
+    state: &AppState,
+    input: FfmpegCommandHistoryInput,
+) -> Result<Vec<FfmpegCommandHistoryItem>, String> {
+    let _guard = state
+        .ffmpeg_command_history_lock
+        .lock()
+        .map_err(|_| "FFmpeg 命令历史记录锁已损坏。".to_string())?;
+    let mut items = read_ffmpeg_command_history_unlocked()?;
+    items.insert(
+        0,
+        FfmpegCommandHistoryItem {
+            id: uuid_like_id(),
+            preset_id: input.preset_id,
+            input_path: input.input_path,
+            secondary_input_path: input.secondary_input_path,
+            output_dir: input.output_dir,
+            audio_format: input.audio_format,
+            start_time: input.start_time,
+            end_time: input.end_time,
+            crf: input.crf,
+            command: input.command,
+            working_dir: input.working_dir,
+            output_path: input.output_path,
+            created_at: unix_timestamp(),
+        },
+    );
+    sort_ffmpeg_command_history(&mut items);
+    write_ffmpeg_command_history_unlocked(&items)?;
+    Ok(items)
+}
+
+fn delete_ffmpeg_command_history_by_ids(
+    state: &AppState,
+    ids: &[String],
+) -> Result<Vec<FfmpegCommandHistoryItem>, String> {
+    let _guard = state
+        .ffmpeg_command_history_lock
+        .lock()
+        .map_err(|_| "FFmpeg 命令历史记录锁已损坏。".to_string())?;
+
+    if ids.is_empty() {
+        let mut items = read_ffmpeg_command_history_unlocked()?;
+        sort_ffmpeg_command_history(&mut items);
+        return Ok(items);
+    }
+
+    let selected: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let mut items = read_ffmpeg_command_history_unlocked()?;
+    items.retain(|item| !selected.contains(item.id.as_str()));
+    sort_ffmpeg_command_history(&mut items);
+    write_ffmpeg_command_history_unlocked(&items)?;
+    Ok(items)
+}
+
+fn clear_ffmpeg_command_history_items(state: &AppState) -> Result<(), String> {
+    let _guard = state
+        .ffmpeg_command_history_lock
+        .lock()
+        .map_err(|_| "FFmpeg 命令历史记录锁已损坏。".to_string())?;
+    write_ffmpeg_command_history_unlocked(&[])
+}
+
+fn sort_ffmpeg_command_history(items: &mut [FfmpegCommandHistoryItem]) {
+    items.sort_by(|left, right| right.created_at.cmp(&left.created_at));
 }
 
 fn delete_history_item_by_id(state: &AppState, id: &str, delete_file: bool) -> Result<(), String> {

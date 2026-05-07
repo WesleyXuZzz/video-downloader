@@ -8,6 +8,8 @@ import type {
   DownloadHistoryItem,
   DownloadRequest,
   FfmpegCommandDraft,
+  FfmpegCommandHistoryInput,
+  FfmpegCommandHistoryItem,
   FfmpegCommandRequest,
   ProgressEvent,
   ProbeResponse,
@@ -27,6 +29,7 @@ const mockToolSettings: ToolSettings = {
   ytDlpPath: null,
   ffmpegPath: null,
 };
+const mockFfmpegCommandHistory: FfmpegCommandHistoryItem[] = [];
 const MOCK_DOWNLOAD_DIR = "Downloads";
 
 export function isTauriRuntime() {
@@ -344,6 +347,62 @@ export async function buildFfmpegCommand(
   }
 
   return invoke<FfmpegCommandDraft>("build_ffmpeg_command", { request });
+}
+
+export async function loadFfmpegCommandHistory(): Promise<
+  FfmpegCommandHistoryItem[]
+> {
+  if (!isTauriRuntime()) {
+    return [...mockFfmpegCommandHistory];
+  }
+
+  return invoke<FfmpegCommandHistoryItem[]>("load_ffmpeg_command_history");
+}
+
+export async function appendFfmpegCommandHistory(
+  item: FfmpegCommandHistoryInput,
+): Promise<FfmpegCommandHistoryItem[]> {
+  if (!isTauriRuntime()) {
+    const nextItem: FfmpegCommandHistoryItem = {
+      ...item,
+      id: crypto.randomUUID(),
+      createdAt: String(Math.floor(Date.now() / 1000)),
+    };
+    mockFfmpegCommandHistory.unshift(nextItem);
+    return [...mockFfmpegCommandHistory];
+  }
+
+  return invoke<FfmpegCommandHistoryItem[]>("append_ffmpeg_command_history", {
+    item,
+  });
+}
+
+export async function deleteFfmpegCommandHistoryItems(
+  ids: string[],
+): Promise<FfmpegCommandHistoryItem[]> {
+  if (!isTauriRuntime()) {
+    const selectedIds = new Set(ids);
+    for (let index = mockFfmpegCommandHistory.length - 1; index >= 0; index -= 1) {
+      if (selectedIds.has(mockFfmpegCommandHistory[index].id)) {
+        mockFfmpegCommandHistory.splice(index, 1);
+      }
+    }
+    return [...mockFfmpegCommandHistory];
+  }
+
+  return invoke<FfmpegCommandHistoryItem[]>(
+    "delete_ffmpeg_command_history_items",
+    { ids },
+  );
+}
+
+export async function clearFfmpegCommandHistory(): Promise<void> {
+  if (!isTauriRuntime()) {
+    mockFfmpegCommandHistory.splice(0);
+    return;
+  }
+
+  return invoke<void>("clear_ffmpeg_command_history");
 }
 
 export async function prefillTerminalCommand(
