@@ -2,7 +2,7 @@
 
 ## 项目用途
 
-Video Downloader 是一个个人本地桌面视频下载器。应用提供可视化界面录入 `yt-dlp` 支持的网站 URL，通过本机 `yt-dlp` 解析与下载视频，并使用 `ffmpeg` 合并分离的音视频流。应用也提供工具路径配置、工具更新检查、支持站点示例、下载历史记录，以及 FFmpeg 命令生成工具箱。
+Video Downloader 是一个个人本地桌面视频下载器。应用提供可视化界面录入 `yt-dlp` 支持的网站 URL，通过本机 `yt-dlp` 解析与下载视频，并使用 `ffmpeg` 合并分离的音视频流。应用也提供工具路径配置、工具更新检查、支持站点示例、下载历史记录，以及支持命令历史的 FFmpeg 命令生成工具箱。
 
 ## 主要目录结构
 
@@ -11,7 +11,7 @@ Video Downloader 是一个个人本地桌面视频下载器。应用提供可视
 - `src/tauri.ts`：前端调用 Tauri 命令、文件选择器、事件监听和浏览器预览 mock。
 - `src/types.ts`：前后端交互使用的 TypeScript 类型。
 - `src-tauri/`：Tauri 2 桌面壳与 Rust 后端命令。
-- `src-tauri/src/lib.rs`：依赖检测、工具路径设置、更新检查、支持站点读取、URL 探测、下载任务、取消任务、历史记录、FFmpeg 命令生成等核心逻辑。
+- `src-tauri/src/lib.rs`：依赖检测、工具路径设置、更新检查、支持站点读取、URL 探测、下载任务、取消任务、历史记录、FFmpeg 命令生成与命令历史等核心逻辑。
 - `src-tauri/capabilities/`：Tauri 权限声明。
 
 ## 常用命令
@@ -33,7 +33,7 @@ Video Downloader 是一个个人本地桌面视频下载器。应用提供可视
 - `yt-dlp`：解析与下载视频。
 - `ffmpeg`：合并分离的音视频流。
 
-应用会优先使用用户手动配置的工具路径，其次使用环境变量和 `PATH` 中可发现的工具。手动配置会写入应用数据目录的 `tool-settings.json`，下载历史会写入应用数据目录的 `history.json`。
+应用会优先使用用户手动配置的工具路径，其次使用环境变量和 `PATH` 中可发现的工具。手动配置会写入应用数据目录的 `tool-settings.json`，下载历史会写入应用数据目录的 `history.json`，FFmpeg 命令历史会写入应用数据目录的 `ffmpeg-command-history.json`。
 
 macOS 推荐安装命令：
 
@@ -53,6 +53,6 @@ curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSf | sh
 - 登录态只通过 `yt-dlp --cookies-from-browser` 从本机浏览器读取。
 - 只下载用户有权下载或离线保存的内容。
 - 默认不做远程下载服务，所有下载任务在本机执行。
-- FFmpeg 工具箱只生成、复制或带入终端命令；默认不在应用内直接执行转码命令。
+- FFmpeg 工具箱只生成、复制、复用或带入终端命令；默认不在应用内直接执行转码命令。命令历史可能包含用户选择的本地媒体文件路径。
 - 不要未经确认批量删除文件或目录，尤其不要使用递归强制删除命令。
 - 打包命令默认面向 release；如果新增打包脚本，优先命名为 `build-app.sh`。
