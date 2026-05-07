@@ -13,9 +13,9 @@
     "windows": [
       {
         "title": "视频下载器",
-        "width": 1180,
+        "width": 1280,
         "height": 760,
-        "minWidth": 980,
+        "minWidth": 1200,
         "minHeight": 640
       }
     ],
