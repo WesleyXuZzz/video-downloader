@@ -556,7 +556,14 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
         let mut command = Command::new(&yt_dlp_path);
         apply_tool_env(&state, &mut command);
         command
+            .arg("--progress")
             .arg("--newline")
+            .arg("--color")
+            .arg("stderr:never")
+            .arg("--progress-delta")
+            .arg("0.5")
+            .arg("--progress-template")
+            .arg("download:VD_PROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s")
             .arg("--no-playlist")
             .arg("--socket-timeout")
             .arg("30")
@@ -2177,6 +2184,12 @@ fn resolution_score(resolution: Option<&str>) -> u64 {
 }
 
 fn parse_progress_line(line: &str) -> Option<(f64, Option<String>, Option<String>)> {
+    let line = strip_ansi_codes(line);
+
+    if let Some(progress_line) = line.trim().strip_prefix("VD_PROGRESS:") {
+        return parse_machine_progress_line(progress_line);
+    }
+
     if !line.contains("[download]") || !line.contains('%') {
         return None;
     }
@@ -2189,15 +2202,72 @@ fn parse_progress_line(line: &str) -> Option<(f64, Option<String>, Option<String
         .unwrap_or(0);
     let progress = before_percent[number_start..].parse::<f64>().ok()?;
 
-    let speed = extract_after(line, " at ", " ETA ");
-    let eta = line
-        .split(" ETA ")
-        .nth(1)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
+    let speed =
+        extract_after(&line, " at ", " ETA ").and_then(|value| normalize_progress_value(&value));
+    let eta = line.split(" ETA ").nth(1).and_then(normalize_eta_value);
 
     Some((progress, speed, eta))
+}
+
+fn parse_machine_progress_line(line: &str) -> Option<(f64, Option<String>, Option<String>)> {
+    let mut fields = line.split('|');
+    let progress = fields.next().and_then(parse_percent_value)?;
+    let speed = fields.next().and_then(normalize_progress_value);
+    let eta = fields.next().and_then(normalize_eta_value);
+
+    Some((progress, speed, eta))
+}
+
+fn parse_percent_value(value: &str) -> Option<f64> {
+    let value = value.trim().trim_end_matches('%').trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    value.parse::<f64>().ok()
+}
+
+fn normalize_eta_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = value.split_whitespace().next().unwrap_or(value);
+    normalize_progress_value(value)
+}
+
+fn normalize_progress_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    let lower_value = value.to_ascii_lowercase();
+    if value.is_empty()
+        || lower_value == "n/a"
+        || lower_value == "na"
+        || lower_value == "unknown"
+        || lower_value.starts_with("unknown ")
+        || value == "-"
+    {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn strip_ansi_codes(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        result.push(character);
+    }
+
+    result
 }
 
 fn extract_after(line: &str, marker: &str, until: &str) -> Option<String> {
@@ -2210,6 +2280,57 @@ fn extract_after(line: &str, marker: &str, until: &str) -> Option<String> {
         None
     } else {
         Some(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_machine_progress_line() {
+        let parsed = parse_progress_line("VD_PROGRESS: 12.3%|8.4MiB/s|00:42").unwrap();
+
+        assert_eq!(parsed.0, 12.3);
+        assert_eq!(parsed.1.as_deref(), Some("8.4MiB/s"));
+        assert_eq!(parsed.2.as_deref(), Some("00:42"));
+
+        let parsed = parse_progress_line("VD_PROGRESS: 40%|Unknown B/s|Unknown ETA").unwrap();
+
+        assert_eq!(parsed.0, 40.0);
+        assert_eq!(parsed.1, None);
+        assert_eq!(parsed.2, None);
+    }
+
+    #[test]
+    fn parses_fragment_download_progress_line() {
+        let parsed = parse_progress_line(
+            "[download]  35.2% of ~120.00MiB at 3.1MiB/s ETA 00:25 (frag 20/80)",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.0, 35.2);
+        assert_eq!(parsed.1.as_deref(), Some("3.1MiB/s"));
+        assert_eq!(parsed.2.as_deref(), Some("00:25"));
+    }
+
+    #[test]
+    fn parses_completed_download_progress_line() {
+        let parsed =
+            parse_progress_line("[download] 100% of 120.00MiB in 00:30 at 4.0MiB/s").unwrap();
+
+        assert_eq!(parsed.0, 100.0);
+        assert_eq!(parsed.1.as_deref(), Some("4.0MiB/s"));
+        assert_eq!(parsed.2, None);
+    }
+
+    #[test]
+    fn ignores_non_progress_lines() {
+        assert_eq!(parse_progress_line("[info] Extracting URL"), None);
+        assert_eq!(
+            parse_progress_line("VD_PROGRESS: Unknown|N/A|Unknown"),
+            None
+        );
     }
 }
 
