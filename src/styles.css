@@ -641,6 +641,7 @@ body {
 
 .download-card,
 .ffmpeg-card,
+.ffmpeg-history-card,
 .queue-card,
 .status-side-card,
 .download-status-card,
@@ -649,12 +650,17 @@ body {
   box-shadow: var(--shadow);
 }
 
+.ffmpeg-workbench {
+  width: 100%;
+}
+
 .download-card .ant-card-body,
 .ffmpeg-card .ant-card-body {
   padding: 18px;
 }
 
-.ffmpeg-card .ant-card-head-title {
+.ffmpeg-card .ant-card-head-title,
+.ffmpeg-history-card .ant-card-head-title {
   color: #25312e;
   font-weight: 760;
 }
@@ -1019,6 +1025,7 @@ body {
   border-radius: 8px;
   font-size: 14px;
   font-weight: 700;
+  box-shadow: none;
 }
 
 .ffmpeg-command-actions .ffmpeg-action-button.is-build:not(:disabled) {
@@ -1060,22 +1067,22 @@ body {
 }
 
 .ffmpeg-command-actions .ffmpeg-action-button.is-terminal:not(:disabled) {
-  color: #ffffff;
-  background: #17202b;
-  border-color: #17202b;
+  color: #475569;
+  background: #f8fafc;
+  border-color: #cbd5e1;
 }
 
 .ffmpeg-command-actions .ffmpeg-action-button.is-terminal:disabled {
-  color: rgba(23, 32, 43, 0.46) !important;
-  background: rgba(23, 32, 43, 0.1) !important;
-  border-color: rgba(23, 32, 43, 0.28) !important;
+  color: rgba(71, 85, 105, 0.48) !important;
+  background: rgba(248, 250, 252, 0.88) !important;
+  border-color: rgba(203, 213, 225, 0.72) !important;
 }
 
 .ffmpeg-command-actions .ffmpeg-action-button.is-terminal:not(:disabled):hover,
 .ffmpeg-command-actions .ffmpeg-action-button.is-terminal:not(:disabled):focus-visible {
-  color: #ffffff;
-  background: #0f172a;
-  border-color: #0f172a;
+  color: #334155;
+  background: #f1f5f9;
+  border-color: #94a3b8;
 }
 
 .ffmpeg-inline-actions {
@@ -1094,8 +1101,280 @@ body {
   overflow-wrap: anywhere;
 }
 
+.ffmpeg-notice-region {
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  transition:
+    max-height 160ms ease,
+    opacity 120ms ease;
+}
+
+.ffmpeg-notice-region.has-notice {
+  max-height: 96px;
+  opacity: 1;
+}
+
 .ffmpeg-notice .ant-alert-message {
   overflow-wrap: anywhere;
+}
+
+.ffmpeg-history-card .ant-card-body {
+  padding: 0;
+}
+
+.ffmpeg-history-card .ant-card-head {
+  min-height: 48px;
+  padding: 0 18px;
+}
+
+.ffmpeg-history-card .ant-card-head-wrapper {
+  min-height: 48px;
+}
+
+.ffmpeg-history-card .ant-card-extra {
+  min-width: 0;
+}
+
+.ffmpeg-history-head-button.ant-btn {
+  display: inline-flex;
+  min-width: 64px;
+  height: 26px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 9px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ffmpeg-history-head-button.ant-btn .anticon {
+  font-size: 13px;
+}
+
+.ffmpeg-history-head-button.is-select:not(:disabled) {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border-color: #93c5fd;
+}
+
+.ffmpeg-history-head-button.is-select:not(:disabled):hover,
+.ffmpeg-history-head-button.is-select:not(:disabled):focus-visible {
+  color: #ffffff;
+  background: #2563eb;
+  border-color: #2563eb;
+}
+
+.ffmpeg-history-head-button.is-refresh:not(:disabled) {
+  color: #475569;
+  background: #ffffff;
+  border-color: #cbd5e1;
+}
+
+.ffmpeg-history-head-button.is-refresh:not(:disabled):hover,
+.ffmpeg-history-head-button.is-refresh:not(:disabled):focus-visible {
+  color: #1677ff;
+  background: #f8fafc;
+  border-color: #94a3b8;
+}
+
+.ffmpeg-history-head-button.is-delete-selected:not(:disabled) {
+  color: #a16207;
+  background: #fefce8;
+  border-color: #fde047;
+}
+
+.ffmpeg-history-head-button.is-delete-selected:not(:disabled):hover,
+.ffmpeg-history-head-button.is-delete-selected:not(:disabled):focus-visible {
+  color: #ffffff;
+  background: #ca8a04;
+  border-color: #ca8a04;
+}
+
+.ffmpeg-history-head-button.is-clear:not(:disabled) {
+  color: #be123c;
+  background: #fff1f2;
+  border-color: #fda4af;
+}
+
+.ffmpeg-history-head-button.is-clear:not(:disabled):hover,
+.ffmpeg-history-head-button.is-clear:not(:disabled):focus-visible {
+  color: #ffffff;
+  background: #e11d48;
+  border-color: #e11d48;
+}
+
+.ffmpeg-history-head-button.is-select:disabled {
+  color: rgba(29, 78, 216, 0.44) !important;
+  background: rgba(239, 246, 255, 0.82) !important;
+  border-color: rgba(147, 197, 253, 0.72) !important;
+}
+
+.ffmpeg-history-head-button.is-refresh:disabled {
+  color: rgba(71, 85, 105, 0.46) !important;
+  background: rgba(255, 255, 255, 0.84) !important;
+  border-color: rgba(203, 213, 225, 0.72) !important;
+}
+
+.ffmpeg-history-head-button.is-delete-selected:disabled {
+  color: rgba(161, 98, 7, 0.44) !important;
+  background: rgba(254, 252, 232, 0.9) !important;
+  border-color: rgba(253, 224, 71, 0.72) !important;
+}
+
+.ffmpeg-history-head-button.is-clear:disabled {
+  color: rgba(190, 18, 60, 0.44) !important;
+  background: rgba(255, 241, 242, 0.86) !important;
+  border-color: rgba(253, 164, 175, 0.72) !important;
+}
+
+.ffmpeg-history-table-head {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: 14px;
+  min-height: 48px;
+  align-items: center;
+  padding: 0 18px;
+  background: #f8fafc;
+  border-bottom: 1px solid var(--line);
+}
+
+.ffmpeg-history-table-head.is-selecting {
+  grid-template-columns: auto 180px minmax(0, 1fr);
+}
+
+.ffmpeg-history-table-head > .ant-typography {
+  color: #34423d;
+  font-size: 12px;
+}
+
+.ffmpeg-history-preset-heading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ffmpeg-history-preset-heading > .ant-typography {
+  flex: 0 0 auto;
+  color: #34423d;
+  font-size: 12px;
+}
+
+.ffmpeg-history-filter.ant-select {
+  width: 96px;
+  height: 28px;
+}
+
+.ffmpeg-history-filter.ant-select .ant-select-selector {
+  height: 28px !important;
+  min-height: 28px;
+  align-items: center;
+  border-color: #d8e0ea !important;
+  border-radius: 7px !important;
+  box-shadow: none !important;
+}
+
+.ffmpeg-history-filter.ant-select .ant-select-selection-item {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  font-size: 12px;
+}
+
+.ffmpeg-history-filter.ant-select .ant-select-arrow {
+  font-size: 10px;
+}
+
+.ffmpeg-history-list .ant-list-item {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+  padding: 16px 18px;
+}
+
+.ffmpeg-history-list .ant-list-item.is-selecting {
+  grid-template-columns: auto 180px minmax(0, 1fr);
+}
+
+.ffmpeg-history-list .ant-list-item + .ant-list-item {
+  border-top: 1px solid var(--line);
+}
+
+.ffmpeg-history-preset-cell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ffmpeg-history-preset-cell .ant-tag {
+  flex: 0 0 auto;
+  margin-inline-end: 0;
+  border-radius: 7px;
+  font-weight: 650;
+}
+
+.ffmpeg-history-time {
+  overflow: hidden;
+  min-width: 0;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ffmpeg-history-command-cell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  min-width: 0;
+}
+
+.ffmpeg-history-command.ant-input {
+  margin-top: 2px;
+  background: #f8fafc;
+}
+
+.ffmpeg-history-actions {
+  justify-content: flex-end;
+}
+
+.ffmpeg-history-empty.ant-empty {
+  margin: 0;
+  padding: 48px 18px;
+}
+
+.ffmpeg-history-footer {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  padding: 0 18px;
+  border-top: 1px solid var(--line);
+}
+
+.ffmpeg-history-pagination.ant-pagination {
+  display: flex;
+  align-items: center;
+  flex: 0 1 auto;
+  margin: 0;
+}
+
+.ffmpeg-history-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex: 0 0 auto;
+  height: 48px;
+  min-width: 92px;
+  font-size: 12px;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .history-page-card .ant-card-head-title {
@@ -1190,6 +1469,7 @@ body {
 
 .download-status-cover {
   display: grid;
+  position: relative;
   overflow: hidden;
   width: 100%;
   aspect-ratio: 16 / 9;
@@ -1203,9 +1483,60 @@ body {
 }
 
 .download-status-cover img {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
+  opacity: 0;
+  transition: opacity 180ms ease;
+}
+
+.download-status-cover img.is-loaded {
+  opacity: 1;
+}
+
+.download-status-cover-placeholder {
+  display: grid;
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  gap: 6px;
+  padding: 12px;
+  text-align: center;
+  place-content: center;
+  place-items: center;
+}
+
+.download-status-cover-placeholder .anticon {
+  font-size: 28px;
+}
+
+.download-status-cover-placeholder span {
+  max-width: 100%;
+  color: #1d4ed8;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.download-status-cover-placeholder.is-failed span {
+  color: #b42318;
+}
+
+.download-status-cover-placeholder.is-failed {
+  color: #cf1322;
+  background: linear-gradient(135deg, #fff1f0, #fff7e6);
+}
+
+.download-status-cover-placeholder.is-missing {
+  color: #64748b;
+  background: linear-gradient(135deg, #f8fafc, #eef2ff);
+}
+
+.download-status-cover-placeholder.is-missing span {
+  color: #475569;
 }
 
 .download-status-content {

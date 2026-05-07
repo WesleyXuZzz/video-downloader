@@ -27,6 +27,7 @@ import {
   ExportOutlined,
   FolderOpenOutlined,
   LinkOutlined,
+  LoadingOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   PauseCircleOutlined,
@@ -50,14 +51,18 @@ import {
   useState,
 } from "react";
 import {
+  appendFfmpegCommandHistory,
   buildFfmpegCommand,
   cancelDownload,
   checkDependencies,
   checkToolUpdates,
+  clearFfmpegCommandHistory,
   clearToolPath,
+  deleteFfmpegCommandHistoryItems,
   deleteHistoryItem,
   loadHistory,
   getDefaultDownloadDir,
+  loadFfmpegCommandHistory,
   loadToolSettings,
   loadSupportedSites,
   parseDownloadQueue,
@@ -79,6 +84,8 @@ import type {
   DownloadQueueStatus,
   DownloadStatus,
   FfmpegCommandDraft,
+  FfmpegCommandHistoryItem,
+  FfmpegCommandRequest,
   FfmpegPresetId,
   FormatOption,
   ProbeResponse,
@@ -108,6 +115,7 @@ const HistoryView = lazy(() => import("./views/HistoryView"));
 const DEFAULT_URL =
   "https://www.bilibili.com/video/BV1KnRPBoEvP/?spm_id_from=333.337.search-card.all.click&vd_source=63d5a0055107645aef295cbb1df0daee";
 const DEFAULT_CONCURRENCY = 1;
+const THUMBNAIL_RETRY_LIMIT = 3;
 
 const appIconUrl = new URL("./assets/app-icon.png", import.meta.url).href;
 
@@ -162,6 +170,26 @@ type ThumbnailLoadFailure = {
   url: string;
   attempts: number;
 };
+
+type ThumbnailLoadState = {
+  status: "loading" | "loaded" | "failed";
+  attempts: number;
+};
+
+type ThumbnailDisplayState = {
+  label: string;
+  status: ThumbnailLoadState["status"] | "missing";
+  attempts: number;
+  canRenderImage: boolean;
+  showImage: boolean;
+};
+
+class FfmpegHistorySaveError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FfmpegHistorySaveError";
+  }
+}
 
 const sidebarNavItems: Array<{
   key: ActiveView;
@@ -221,14 +249,27 @@ export default function App() {
   const [ffmpegDraft, setFfmpegDraft] =
     useState<FfmpegCommandDraft | null>(null);
   const [ffmpegNotice, setFfmpegNotice] = useState<Notice | null>(null);
+  const [ffmpegCommandHistory, setFfmpegCommandHistory] = useState<
+    FfmpegCommandHistoryItem[]
+  >([]);
+  const [hasLoadedFfmpegCommandHistory, setHasLoadedFfmpegCommandHistory] =
+    useState(false);
+  const [isLoadingFfmpegCommandHistory, setIsLoadingFfmpegCommandHistory] =
+    useState(false);
+  const [isMutatingFfmpegCommandHistory, setIsMutatingFfmpegCommandHistory] =
+    useState(false);
   const [isBuildingFfmpeg, setIsBuildingFfmpeg] = useState(false);
   const [isPrefillingTerminal, setIsPrefillingTerminal] = useState(false);
   const [failedThumbnail, setFailedThumbnail] =
     useState<ThumbnailLoadFailure | null>(null);
+  const [thumbnailLoadStates, setThumbnailLoadStates] = useState<
+    Record<string, ThumbnailLoadState>
+  >({});
   const activeTaskRef = useRef<Set<string>>(new Set());
   const startingTaskRef = useRef<Set<string>>(new Set());
   const metadataProbeRef = useRef<Set<string>>(new Set());
   const schedulingRef = useRef(false);
+  const keepNextFfmpegDraftResetRef = useRef(false);
 
   const formatOptions = useMemo<FormatOption[]>(() => {
     return probe?.formats.length ? probe.formats : fallbackFormats;
@@ -263,6 +304,17 @@ export default function App() {
       null
     );
   }, [queue]);
+  const currentThumbnailState = useMemo(
+    () =>
+      currentQueueItem
+        ? thumbnailDisplayState(
+            currentQueueItem,
+            failedThumbnail,
+            thumbnailLoadStates,
+          )
+        : null,
+    [currentQueueItem, failedThumbnail, thumbnailLoadStates],
+  );
   const urlLineCount = useMemo(() => parseUrlLines(url).length, [url]);
   const parseActionLabel = urlLineCount > 1 ? "解析队列" : "解析视频";
   const startActionLabel =
@@ -302,6 +354,20 @@ export default function App() {
   useEffect(() => {
     scheduleQueuedDownloads();
   }, [queue, concurrency, isQueuePaused, outputDir, selectedFormat, browser]);
+
+  useEffect(() => {
+    if (
+      activeView === "ffmpeg" &&
+      !hasLoadedFfmpegCommandHistory &&
+      !isLoadingFfmpegCommandHistory
+    ) {
+      void refreshFfmpegCommandHistory();
+    }
+  }, [
+    activeView,
+    hasLoadedFfmpegCommandHistory,
+    isLoadingFfmpegCommandHistory,
+  ]);
 
   useEffect(() => {
     const candidates = queue
@@ -367,6 +433,11 @@ export default function App() {
   }, [probe?.thumbnail, currentQueueItem?.id, currentQueueItem?.thumbnail]);
 
   useEffect(() => {
+    if (keepNextFfmpegDraftResetRef.current) {
+      keepNextFfmpegDraftResetRef.current = false;
+      return;
+    }
+
     setFfmpegDraft(null);
     setFfmpegNotice(null);
   }, [
@@ -548,6 +619,7 @@ export default function App() {
       startingTaskRef.current.clear();
       metadataProbeRef.current.clear();
       setFailedThumbnail(null);
+      setThumbnailLoadStates({});
       setQueue(nextQueue);
       setStatus(nextQueue.some((item) => item.status === "failed") ? "failed" : "idle");
       setProgress(0);
@@ -577,6 +649,8 @@ export default function App() {
     setEta(null);
     setOutputPath(null);
     setError(null);
+    setFailedThumbnail(null);
+    setThumbnailLoadStates({});
     startingTaskRef.current.clear();
     metadataProbeRef.current.clear();
   }
@@ -626,6 +700,7 @@ export default function App() {
 
   function handleRetryQueueItem(item: QueueItem) {
     startingTaskRef.current.delete(item.id);
+    clearThumbnailLoadState(item);
     setQueue((items) =>
       items.map((candidate) =>
         candidate.id === item.id
@@ -646,7 +721,75 @@ export default function App() {
 
   function handleRemoveQueueItem(item: QueueItem) {
     startingTaskRef.current.delete(item.id);
+    clearThumbnailLoadState(item);
     setQueue((items) => items.filter((candidate) => candidate.id !== item.id));
+  }
+
+  function handleThumbnailLoad(item: QueueItem) {
+    const thumbnailUrl = item.thumbnail;
+    const key = thumbnailLoadKey(item);
+
+    if (!thumbnailUrl || !key) {
+      return;
+    }
+
+    setThumbnailLoadStates((states) => ({
+      ...states,
+      [key]: {
+        status: "loaded",
+        attempts: states[key]?.attempts ?? 0,
+      },
+    }));
+    setFailedThumbnail((failure) =>
+      failure?.taskId === item.id && failure.url === thumbnailUrl ? null : failure,
+    );
+  }
+
+  function handleThumbnailError(item: QueueItem) {
+    const thumbnailUrl = item.thumbnail;
+    const key = thumbnailLoadKey(item);
+
+    if (!thumbnailUrl || !key) {
+      return;
+    }
+
+    const failedAttempts =
+      failedThumbnail?.taskId === item.id && failedThumbnail.url === thumbnailUrl
+        ? failedThumbnail.attempts
+        : 0;
+    const nextAttempts =
+      Math.max(thumbnailLoadStates[key]?.attempts ?? 0, failedAttempts) + 1;
+
+    setThumbnailLoadStates((states) => ({
+      ...states,
+      [key]: {
+        status: nextAttempts >= THUMBNAIL_RETRY_LIMIT ? "failed" : "loading",
+        attempts: nextAttempts,
+      },
+    }));
+    setFailedThumbnail({
+      taskId: item.id,
+      url: thumbnailUrl,
+      attempts: nextAttempts,
+    });
+  }
+
+  function clearThumbnailLoadState(item: QueueItem) {
+    const key = thumbnailLoadKey(item);
+
+    if (!key) {
+      return;
+    }
+
+    setThumbnailLoadStates((states) => {
+      const { [key]: _removed, ...rest } = states;
+      return rest;
+    });
+    setFailedThumbnail((failure) =>
+      failure?.taskId === item.id && failure.url === item.thumbnail
+        ? null
+        : failure,
+    );
   }
 
   async function cancelAllQueueItems() {
@@ -811,9 +954,19 @@ export default function App() {
   }
 
   async function handleBuildFfmpegDraft() {
+    const request = currentFfmpegCommandRequest();
+
     try {
-      await createFfmpegDraft();
-    } catch {
+      const draft = await createFfmpegDraft(request);
+      await appendGeneratedFfmpegCommand(request, draft);
+    } catch (caught) {
+      if (caught instanceof FfmpegHistorySaveError) {
+        setFfmpegNotice({
+          type: "warning",
+          text: `命令已生成，但历史保存失败：${caught.message}`,
+        });
+        return;
+      }
       // createFfmpegDraft already exposes the error in the tool panel.
     }
   }
@@ -855,7 +1008,22 @@ export default function App() {
     }
   }
 
-  async function createFfmpegDraft() {
+  function currentFfmpegCommandRequest(): FfmpegCommandRequest {
+    return {
+      presetId: ffmpegPreset,
+      inputPath: ffmpegInputPath.trim(),
+      secondaryInputPath: ffmpegSecondaryInputPath.trim() || null,
+      outputDir: ffmpegOutputDir.trim(),
+      audioFormat: ffmpegAudioFormat,
+      crf: ffmpegCrf,
+      startTime: ffmpegStartTime.trim() || null,
+      endTime: ffmpegEndTime.trim() || null,
+    };
+  }
+
+  async function createFfmpegDraft(
+    request = currentFfmpegCommandRequest(),
+  ): Promise<FfmpegCommandDraft> {
     if (!canBuildFfmpegCommand) {
       throw new Error(
         ffmpegPreset === "mergeAudioVideo"
@@ -865,19 +1033,9 @@ export default function App() {
     }
 
     setIsBuildingFfmpeg(true);
-    setFfmpegNotice(null);
 
     try {
-      const draft = await buildFfmpegCommand({
-        presetId: ffmpegPreset,
-        inputPath: ffmpegInputPath.trim(),
-        secondaryInputPath: ffmpegSecondaryInputPath.trim() || null,
-        outputDir: ffmpegOutputDir.trim(),
-        audioFormat: ffmpegAudioFormat,
-        crf: ffmpegCrf,
-        startTime: ffmpegStartTime.trim() || null,
-        endTime: ffmpegEndTime.trim() || null,
-      });
+      const draft = await buildFfmpegCommand(request);
       setFfmpegDraft(draft);
       setFfmpegNotice({ type: "success", text: "命令已生成。" });
       return draft;
@@ -886,6 +1044,115 @@ export default function App() {
       throw caught;
     } finally {
       setIsBuildingFfmpeg(false);
+    }
+  }
+
+  async function appendGeneratedFfmpegCommand(
+    request: FfmpegCommandRequest,
+    draft: FfmpegCommandDraft,
+  ) {
+    setIsMutatingFfmpegCommandHistory(true);
+
+    try {
+      const items = await appendFfmpegCommandHistory({
+        ...request,
+        command: draft.command,
+        workingDir: draft.workingDir,
+        outputPath: draft.outputPath,
+      });
+      setFfmpegCommandHistory(items);
+      setHasLoadedFfmpegCommandHistory(true);
+    } catch (caught) {
+      throw new FfmpegHistorySaveError(readError(caught));
+    } finally {
+      setIsMutatingFfmpegCommandHistory(false);
+    }
+  }
+
+  async function refreshFfmpegCommandHistory() {
+    setIsLoadingFfmpegCommandHistory(true);
+
+    try {
+      const items = await loadFfmpegCommandHistory();
+      setFfmpegCommandHistory(items);
+      setHasLoadedFfmpegCommandHistory(true);
+    } catch (caught) {
+      setFfmpegNotice({
+        type: "warning",
+        text: `读取命令历史失败：${readError(caught)}`,
+      });
+      setHasLoadedFfmpegCommandHistory(true);
+    } finally {
+      setIsLoadingFfmpegCommandHistory(false);
+    }
+  }
+
+  async function handleDeleteFfmpegCommandHistoryItems(ids: string[]) {
+    if (ids.length === 0 || isMutatingFfmpegCommandHistory) {
+      return;
+    }
+
+    setIsMutatingFfmpegCommandHistory(true);
+
+    try {
+      const items = await deleteFfmpegCommandHistoryItems(ids);
+      setFfmpegCommandHistory(items);
+      setHasLoadedFfmpegCommandHistory(true);
+    } catch (caught) {
+      setFfmpegNotice({
+        type: "warning",
+        text: `删除命令历史失败：${readError(caught)}`,
+      });
+    } finally {
+      setIsMutatingFfmpegCommandHistory(false);
+    }
+  }
+
+  async function handleClearFfmpegCommandHistory() {
+    if (isMutatingFfmpegCommandHistory) {
+      return;
+    }
+
+    setIsMutatingFfmpegCommandHistory(true);
+
+    try {
+      await clearFfmpegCommandHistory();
+      setFfmpegCommandHistory([]);
+      setHasLoadedFfmpegCommandHistory(true);
+    } catch (caught) {
+      setFfmpegNotice({
+        type: "warning",
+        text: `清空命令历史失败：${readError(caught)}`,
+      });
+    } finally {
+      setIsMutatingFfmpegCommandHistory(false);
+    }
+  }
+
+  function applyFfmpegCommandHistoryItem(item: FfmpegCommandHistoryItem) {
+    keepNextFfmpegDraftResetRef.current = true;
+    setFfmpegPreset(item.presetId);
+    setFfmpegInputPath(item.inputPath);
+    setFfmpegSecondaryInputPath(item.secondaryInputPath ?? "");
+    setFfmpegOutputDir(item.outputDir);
+    setFfmpegAudioFormat(item.audioFormat ?? "mp3");
+    setFfmpegCrf(item.crf ?? 28);
+    setFfmpegStartTime(item.startTime ?? "00:00:00");
+    setFfmpegEndTime(item.endTime ?? "00:00:30");
+    setFfmpegDraft({
+      command: item.command,
+      workingDir: item.workingDir,
+      outputPath: item.outputPath,
+    });
+    setFfmpegNotice({ type: "success", text: "已填回历史命令。" });
+  }
+
+  async function handleCopyFfmpegHistoryCommand(command: string) {
+    try {
+      await copyTextToClipboard(command);
+      setFfmpegNotice({ type: "success", text: "历史命令已复制。" });
+    } catch (caught) {
+      setFfmpegNotice({ type: "warning", text: readError(caught) });
     }
   }
 
@@ -956,6 +1223,8 @@ export default function App() {
     setUrl(item.url || DEFAULT_URL);
     setOutputDir(item.outputDir || FALLBACK_OUTPUT_DIR);
     setSelectedFormat(item.format || "bv*+ba/b");
+    setFailedThumbnail(null);
+    setThumbnailLoadStates({});
     setQueue([
       {
         id: crypto.randomUUID(),
@@ -1265,33 +1534,33 @@ export default function App() {
               <div className="download-status-strip">
                 <div className="download-status-cover">
                   {currentQueueItem.thumbnail &&
-                  shouldRenderThumbnail(currentQueueItem, failedThumbnail) ? (
-                    <img
-                      alt={currentQueueItem.title}
-                      draggable={false}
-                      onError={() => {
-                        const thumbnailUrl = currentQueueItem.thumbnail;
-
-                        if (!thumbnailUrl) {
-                          return;
+                  currentThumbnailState?.canRenderImage ? (
+                    <>
+                      <img
+                        alt={currentQueueItem.title}
+                        className={
+                          currentThumbnailState.showImage ? "is-loaded" : ""
                         }
-
-                        setFailedThumbnail((failure) =>
-                          failure?.taskId === currentQueueItem.id &&
-                          failure.url === thumbnailUrl
-                            ? { ...failure, attempts: failure.attempts + 1 }
-                            : {
-                                taskId: currentQueueItem.id,
-                                url: thumbnailUrl,
-                                attempts: 1,
-                              },
-                        );
-                      }}
-                      referrerPolicy="no-referrer"
-                      src={thumbnailImageSrc(currentQueueItem, failedThumbnail)}
-                    />
+                        draggable={false}
+                        key={`${currentQueueItem.id}:${currentQueueItem.thumbnail}:${currentThumbnailState.attempts}`}
+                        onError={() => {
+                          handleThumbnailError(currentQueueItem);
+                        }}
+                        onLoad={() => {
+                          handleThumbnailLoad(currentQueueItem);
+                        }}
+                        referrerPolicy="no-referrer"
+                        src={thumbnailImageSrc(
+                          currentQueueItem,
+                          failedThumbnail,
+                        )}
+                      />
+                      {!currentThumbnailState.showImage ? (
+                        <ThumbnailPlaceholder state={currentThumbnailState} />
+                      ) : null}
+                    </>
                   ) : (
-                    <VideoCameraOutlined />
+                    <ThumbnailPlaceholder state={currentThumbnailState} />
                   )}
                 </div>
 
@@ -1496,6 +1765,8 @@ export default function App() {
                 endTime={ffmpegEndTime}
                 inputPath={ffmpegInputPath}
                 isBuilding={isBuildingFfmpeg}
+                isHistoryLoading={isLoadingFfmpegCommandHistory}
+                isHistoryMutating={isMutatingFfmpegCommandHistory}
                 isPrefillingTerminal={isPrefillingTerminal}
                 notice={ffmpegNotice}
                 onAudioFormatChange={setFfmpegAudioFormat}
@@ -1503,19 +1774,25 @@ export default function App() {
                 onChooseInputFile={handleChooseFfmpegInputFile}
                 onChooseOutputDirectory={handleChooseFfmpegOutputDirectory}
                 onChooseSecondaryFile={handleChooseFfmpegSecondaryFile}
+                onClearHistory={handleClearFfmpegCommandHistory}
                 onCopyCommand={handleCopyFfmpegCommand}
+                onCopyHistoryCommand={handleCopyFfmpegHistoryCommand}
                 onCrfChange={setFfmpegCrf}
+                onDeleteHistoryItems={handleDeleteFfmpegCommandHistoryItems}
                 onEndTimeChange={setFfmpegEndTime}
                 onInputPathChange={setFfmpegInputPath}
                 onOutputDirChange={setFfmpegOutputDir}
                 onPrefillTerminal={handlePrefillTerminal}
                 onPresetChange={setFfmpegPreset}
+                onRefreshHistory={refreshFfmpegCommandHistory}
                 onSecondaryInputPathChange={setFfmpegSecondaryInputPath}
                 onStartTimeChange={setFfmpegStartTime}
+                onUseHistoryItem={applyFfmpegCommandHistoryItem}
                 onUseDownloadedFile={handleUseDownloadedFile}
                 outputDir={ffmpegOutputDir}
                 outputPath={outputPath}
                 preset={ffmpegPreset}
+                commandHistory={ffmpegCommandHistory}
                 secondaryInputPath={ffmpegSecondaryInputPath}
                 startTime={ffmpegStartTime}
               />
@@ -2369,18 +2646,91 @@ function queueItemNeedsMetadata(
   );
 }
 
-function shouldRenderThumbnail(
+function thumbnailDisplayState(
   item: QueueItem,
   failedThumbnail: ThumbnailLoadFailure | null,
-) {
-  if (!item.thumbnail) {
-    return false;
+  states: Record<string, ThumbnailLoadState>,
+): ThumbnailDisplayState {
+  const key = thumbnailLoadKey(item);
+
+  if (!item.thumbnail || !key) {
+    return {
+      label: "未获取到封面",
+      status: "missing",
+      attempts: 0,
+      canRenderImage: false,
+      showImage: false,
+    };
   }
 
+  const state = states[key];
+  const failedAttempts =
+    failedThumbnail?.taskId === item.id && failedThumbnail.url === item.thumbnail
+      ? failedThumbnail.attempts
+      : 0;
+  const attempts = Math.max(state?.attempts ?? 0, failedAttempts);
+
+  if (state?.status === "loaded") {
+    return {
+      label: "",
+      status: "loaded",
+      attempts,
+      canRenderImage: true,
+      showImage: true,
+    };
+  }
+
+  if (attempts >= THUMBNAIL_RETRY_LIMIT || state?.status === "failed") {
+    return {
+      label: "封面加载失败",
+      status: "failed",
+      attempts,
+      canRenderImage: false,
+      showImage: false,
+    };
+  }
+
+  return {
+    label:
+      attempts > 0
+        ? `封面重试中 ${attempts}/${THUMBNAIL_RETRY_LIMIT}`
+        : "封面加载中",
+    status: "loading",
+    attempts,
+    canRenderImage: true,
+    showImage: false,
+  };
+}
+
+function thumbnailLoadKey(item: QueueItem) {
+  return item.thumbnail ? `${item.id}:${item.thumbnail}` : null;
+}
+
+function ThumbnailPlaceholder({
+  state,
+}: {
+  state: ThumbnailDisplayState | null;
+}) {
+  const displayState =
+    state ?? {
+      label: "未获取到封面",
+      status: "missing" as const,
+      attempts: 0,
+      canRenderImage: false,
+      showImage: false,
+    };
+  const icon =
+    displayState.status === "loading" ? (
+      <LoadingOutlined spin />
+    ) : (
+      <VideoCameraOutlined />
+    );
+
   return (
-    failedThumbnail?.taskId !== item.id ||
-    failedThumbnail.url !== item.thumbnail ||
-    failedThumbnail.attempts < 3
+    <div className={`download-status-cover-placeholder is-${displayState.status}`}>
+      {icon}
+      <span>{displayState.label}</span>
+    </div>
   );
 }
 
