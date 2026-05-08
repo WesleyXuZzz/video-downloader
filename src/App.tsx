@@ -81,6 +81,7 @@ import type {
   BrowserKind,
   DependencyStatus,
   DownloadHistoryItem,
+  DownloadPhase,
   DownloadQueueStatus,
   DownloadStatus,
   FfmpegCommandDraft,
@@ -105,6 +106,7 @@ import {
   statusCopy,
   statusTagColor,
 } from "./historyUtils";
+import { isKnownFfmpegPresetId } from "./ffmpegPresets";
 
 const { Content, Sider } = Layout;
 const { Text, Title } = Typography;
@@ -112,10 +114,10 @@ const { Text, Title } = Typography;
 const FfmpegView = lazy(() => import("./views/FfmpegView"));
 const HistoryView = lazy(() => import("./views/HistoryView"));
 
-const DEFAULT_URL =
-  "https://www.bilibili.com/video/BV1KnRPBoEvP/?spm_id_from=333.337.search-card.all.click&vd_source=63d5a0055107645aef295cbb1df0daee";
+const DEFAULT_URL = "";
 const DEFAULT_CONCURRENCY = 1;
 const THUMBNAIL_RETRY_LIMIT = 3;
+const QUEUE_AUTH_PROBE_CONCURRENCY = 3;
 
 const appIconUrl = new URL("./assets/app-icon.png", import.meta.url).href;
 
@@ -144,6 +146,56 @@ type Notice = {
 type ActiveView = "download" | "ffmpeg" | "history";
 const FALLBACK_OUTPUT_DIR = "";
 
+type AuthProbeStatus =
+  | "idle"
+  | "checking"
+  | "ready"
+  | "warning"
+  | "failed"
+  | "unavailable";
+
+type AuthProbeState = {
+  status: AuthProbeStatus;
+  browser: BrowserKind;
+  url: string;
+  site?: string | null;
+  title?: string | null;
+  duration?: number | null;
+  bestFormatLabel?: string | null;
+  formatCount?: number | null;
+  checkedAt?: string | null;
+  error?: string | null;
+};
+
+type QueueAuthSiteSummary = {
+  site: string;
+  total: number;
+  ready: number;
+  warning: number;
+  unavailable: number;
+  checking: number;
+  idle: number;
+  parseFailed: number;
+  status?: AuthProbeStatus;
+  bestFormatLabel?: string | null;
+  formatCount?: number | null;
+  error?: string | null;
+};
+
+type QueueAuthSummary = {
+  total: number;
+  probeable: number;
+  ready: number;
+  warning: number;
+  unavailable: number;
+  checking: number;
+  idle: number;
+  parseFailed: number;
+  status: AuthProbeStatus;
+  bestFormatLabel?: string | null;
+  sites: QueueAuthSiteSummary[];
+};
+
 type QueueItem = {
   id: string;
   url: string;
@@ -158,7 +210,11 @@ type QueueItem = {
   sourceOrder?: number | null;
   isPlaylistItem: boolean;
   status: DownloadQueueStatus;
+  parseError?: boolean;
+  authProbe?: AuthProbeState | null;
   progress: number;
+  phase?: DownloadPhase | null;
+  phaseLabel?: string | null;
   speed?: string | null;
   eta?: string | null;
   outputPath?: string | null;
@@ -232,6 +288,11 @@ export default function App() {
   const [supportedSites, setSupportedSites] =
     useState<SupportedSitesResponse | null>(null);
   const [isProbing, setIsProbing] = useState(false);
+  const [authProbe, setAuthProbe] = useState<AuthProbeState>({
+    status: "idle",
+    browser: "chrome",
+    url: "",
+  });
   const [isRefreshingToolMetadata, setIsRefreshingToolMetadata] =
     useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -270,6 +331,8 @@ export default function App() {
   const metadataProbeRef = useRef<Set<string>>(new Set());
   const schedulingRef = useRef(false);
   const keepNextFfmpegDraftResetRef = useRef(false);
+  const authProbeRequestRef = useRef(0);
+  const queueAuthProbeBatchRef = useRef(0);
 
   const formatOptions = useMemo<FormatOption[]>(() => {
     return probe?.formats.length ? probe.formats : fallbackFormats;
@@ -290,17 +353,22 @@ export default function App() {
 
   const pageHeading = getPageHeading(activeView);
   const queueSummary = useMemo(() => summarizeQueue(queue), [queue]);
+  const queueAuthSummary = useMemo(() => summarizeQueueAuth(queue), [queue]);
   const hasRunningQueue = queueSummary.running > 0;
   const hasIdleQueue = queueSummary.idle > 0;
   const hasQueuedQueue = queueSummary.queued > 0;
   const hasCancelableQueue = hasRunningQueue || hasQueuedQueue;
   const hasQueueItems = queue.length > 0;
+  const hasQueueAuthProbeTargets = queue.some(queueItemCanAuthProbe);
+  const isQueueAuthChecking = Boolean(queueAuthSummary?.checking);
   const currentQueueItem = useMemo(() => {
     return (
       queue.find((item) => item.status === "running") ??
       queue.find((item) => item.status === "queued") ??
       queue.find((item) => item.status === "idle") ??
-      queue[0] ??
+      queue.find((item) => item.status === "completed") ??
+      queue.find((item) => item.status === "failed" && !item.parseError) ??
+      queue.find((item) => item.status === "canceled" && !item.parseError) ??
       null
     );
   }, [queue]);
@@ -316,6 +384,7 @@ export default function App() {
     [currentQueueItem, failedThumbnail, thumbnailLoadStates],
   );
   const urlLineCount = useMemo(() => parseUrlLines(url).length, [url]);
+  const firstUrl = useMemo(() => parseUrlLines(url)[0] ?? "", [url]);
   const parseActionLabel = urlLineCount > 1 ? "解析队列" : "解析视频";
   const startActionLabel =
     (hasQueueItems ? queue.length : urlLineCount) > 1
@@ -354,6 +423,40 @@ export default function App() {
   useEffect(() => {
     scheduleQueuedDownloads();
   }, [queue, concurrency, isQueuePaused, outputDir, selectedFormat, browser]);
+
+  useEffect(() => {
+    authProbeRequestRef.current += 1;
+
+    if (hasQueueItems) {
+      setAuthProbe({
+        status: "idle",
+        browser,
+        url: firstUrl,
+      });
+      return;
+    }
+
+    if (!firstUrl) {
+      setAuthProbe({
+        status: "idle",
+        browser,
+        url: "",
+      });
+      return;
+    }
+
+    setAuthProbe({
+      status: "idle",
+      browser,
+      url: firstUrl,
+    });
+
+    const timer = window.setTimeout(() => {
+      void refreshAuthProbe("auto");
+    }, 800);
+
+    return () => window.clearTimeout(timer);
+  }, [browser, firstUrl, hasQueueItems]);
 
   useEffect(() => {
     if (
@@ -551,25 +654,180 @@ export default function App() {
     }
   }
 
-  async function handleProbe() {
-    const firstUrl = parseUrlLines(url)[0];
-    if (!firstUrl) {
+  async function refreshAuthProbe(
+    trigger: "auto" | "manual" | "parse" = "manual",
+  ): Promise<ProbeResponse | null> {
+    const probeUrlValue = firstUrl;
+    const requestId = authProbeRequestRef.current + 1;
+    authProbeRequestRef.current = requestId;
+
+    if (!probeUrlValue) {
+      setAuthProbe({
+        status: "idle",
+        browser,
+        url: "",
+      });
+      return null;
+    }
+
+    setAuthProbe({
+      status: "checking",
+      browser,
+      url: probeUrlValue,
+    });
+    setIsProbing(true);
+    if (trigger !== "auto") {
+      setError(null);
+    }
+
+    try {
+      const result = await probeUrl(probeUrlValue, browser);
+      if (authProbeRequestRef.current !== requestId) {
+        return null;
+      }
+      setProbe(result);
+      setSelectedFormat(result.formats[0]?.selector ?? "bv*+ba/b");
+      setAuthProbe(authProbeStateFromResult(result, browser, probeUrlValue));
+      return result;
+    } catch (caught) {
+      if (authProbeRequestRef.current !== requestId) {
+        return null;
+      }
+      const nextError = readError(caught);
+      setProbe(null);
+      setAuthProbe({
+        status: "unavailable",
+        browser,
+        url: probeUrlValue,
+        error: nextError,
+      });
+      return null;
+    } finally {
+      if (authProbeRequestRef.current === requestId) {
+        setIsProbing(false);
+      }
+    }
+  }
+
+  async function handleAuthProbeRefresh() {
+    if (hasQueueAuthProbeTargets) {
+      await refreshQueueAuthProbes(queue, browser);
       return;
     }
 
-    setIsProbing(true);
-    setError(null);
+    await refreshAuthProbe("manual");
+  }
 
-    try {
-      const result = await probeUrl(firstUrl, browser);
-      setProbe(result);
-      setSelectedFormat(result.formats[0]?.selector ?? "bv*+ba/b");
-    } catch (caught) {
-      setProbe(null);
-      setError(readError(caught));
-    } finally {
-      setIsProbing(false);
+  async function refreshQueueAuthProbes(
+    targetItems = queue,
+    targetBrowser = browser,
+  ) {
+    const candidates = targetItems.filter(queueItemCanAuthProbe);
+    const batchId = queueAuthProbeBatchRef.current + 1;
+    queueAuthProbeBatchRef.current = batchId;
+
+    if (!candidates.length) {
+      return;
     }
+
+    const candidateIds = new Set(candidates.map((item) => item.id));
+    setQueue((items) =>
+      items.map((item) =>
+        candidateIds.has(item.id)
+          ? {
+              ...item,
+              authProbe: {
+                status: "checking",
+                browser: targetBrowser,
+                url: item.url,
+                site: item.site,
+              },
+            }
+          : item,
+      ),
+    );
+
+    let nextIndex = 0;
+    const workerCount = Math.min(QUEUE_AUTH_PROBE_CONCURRENCY, candidates.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (nextIndex < candidates.length) {
+        const item = candidates[nextIndex];
+        nextIndex += 1;
+
+        if (queueAuthProbeBatchRef.current !== batchId) {
+          return;
+        }
+
+        try {
+          const result = await probeUrl(item.url, targetBrowser);
+          if (queueAuthProbeBatchRef.current !== batchId) {
+            return;
+          }
+
+          setQueue((items) =>
+            items.map((candidate) =>
+              candidate.id === item.id
+                ? {
+                    ...mergeQueueMetadata(candidate, result),
+                    authProbe: authProbeStateFromResult(
+                      result,
+                      targetBrowser,
+                      item.url,
+                    ),
+                  }
+                : candidate,
+            ),
+          );
+        } catch (caught) {
+          if (queueAuthProbeBatchRef.current !== batchId) {
+            return;
+          }
+
+          const nextError = readError(caught);
+          setQueue((items) =>
+            items.map((candidate) =>
+              candidate.id === item.id
+                ? {
+                    ...candidate,
+                    authProbe: {
+                      status: "unavailable",
+                      browser: targetBrowser,
+                      url: item.url,
+                      site: candidate.site || siteFromUrl(item.url) || item.site,
+                      error: nextError,
+                    },
+                  }
+                : candidate,
+            ),
+          );
+        }
+      }
+    });
+
+    await Promise.all(workers);
+  }
+
+  function handleBrowserChange(value: BrowserKind) {
+    queueAuthProbeBatchRef.current += 1;
+    setBrowser(value);
+    setQueue((items) =>
+      items.map((item) =>
+        item.parseError
+          ? {
+              ...item,
+              authProbe: queueParseErrorAuthProbe(item, value),
+            }
+          : {
+              ...item,
+              authProbe: {
+                status: "idle",
+                browser: value,
+                url: item.url,
+                site: item.site,
+              },
+            },
+      ),
+    );
   }
 
   function handleAppContextMenu(event: ReactMouseEvent<HTMLElement>) {
@@ -605,13 +863,14 @@ export default function App() {
       return;
     }
 
+    queueAuthProbeBatchRef.current += 1;
     setIsParsingQueue(true);
     setError(null);
 
     try {
       const parsed = await parseDownloadQueue(urls, browser);
       const nextQueue = parsed.map((item) => {
-        const queueItem = queueItemFromParsed(item);
+        const queueItem = queueItemFromParsed(item, browser);
         return startAfterParse && queueItem.status === "idle"
           ? { ...queueItem, status: "queued" as const }
           : queueItem;
@@ -621,12 +880,13 @@ export default function App() {
       setFailedThumbnail(null);
       setThumbnailLoadStates({});
       setQueue(nextQueue);
-      setStatus(nextQueue.some((item) => item.status === "failed") ? "failed" : "idle");
+      setStatus("idle");
       setProgress(0);
       setSpeed(null);
       setEta(null);
       setOutputPath(null);
       message.success(`已解析 ${nextQueue.length} 个队列项`);
+      void refreshQueueAuthProbes(nextQueue, browser);
     } catch (caught) {
       const nextError = readError(caught);
       setError(nextError);
@@ -642,6 +902,7 @@ export default function App() {
       return;
     }
 
+    queueAuthProbeBatchRef.current += 1;
     setQueue([]);
     setStatus("idle");
     setProgress(0);
@@ -692,7 +953,13 @@ export default function App() {
     setQueue((items) =>
       items.map((candidate) =>
         candidate.id === item.id
-          ? { ...candidate, status: "canceled", progress: 0 }
+          ? {
+              ...candidate,
+              status: "canceled",
+              progress: 0,
+              phase: null,
+              phaseLabel: null,
+            }
           : candidate,
       ),
     );
@@ -707,7 +974,16 @@ export default function App() {
           ? {
               ...candidate,
               status: "queued",
+              parseError: false,
+              authProbe: {
+                status: "idle",
+                browser,
+                url: candidate.url,
+                site: candidate.site,
+              },
               progress: 0,
+              phase: null,
+              phaseLabel: null,
               speed: null,
               eta: null,
               outputPath: null,
@@ -802,7 +1078,13 @@ export default function App() {
     setQueue((items) =>
       items.map((item) =>
         item.status === "queued" || item.status === "idle"
-          ? { ...item, status: "canceled", progress: 0 }
+          ? {
+              ...item,
+              status: "canceled",
+              progress: 0,
+              phase: null,
+              phaseLabel: null,
+            }
           : item,
       ),
     );
@@ -873,7 +1155,10 @@ export default function App() {
           ? {
               ...candidate,
               status: "running",
+              parseError: false,
               progress: 0,
+              phase: null,
+              phaseLabel: null,
               speed: null,
               eta: null,
               error: null,
@@ -902,7 +1187,10 @@ export default function App() {
             ? {
                 ...candidate,
                 status: "failed",
+                parseError: false,
                 progress: 0,
+                phase: null,
+                phaseLabel: null,
                 error: nextError,
               }
             : candidate,
@@ -1130,6 +1418,14 @@ export default function App() {
   }
 
   function applyFfmpegCommandHistoryItem(item: FfmpegCommandHistoryItem) {
+    if (!isKnownFfmpegPresetId(item.presetId)) {
+      setFfmpegNotice({
+        type: "warning",
+        text: "当前版本不支持这条历史命令的预设，无法填回表单。",
+      });
+      return;
+    }
+
     keepNextFfmpegDraftResetRef.current = true;
     setFfmpegPreset(item.presetId);
     setFfmpegInputPath(item.inputPath);
@@ -1197,6 +1493,8 @@ export default function App() {
               ...item,
               status: event.status,
               progress: safeProgress,
+              phase: event.phase ?? null,
+              phaseLabel: event.phaseLabel ?? null,
               speed: event.speed ?? null,
               eta: event.eta ?? null,
               outputPath: event.outputPath ?? item.outputPath ?? null,
@@ -1220,30 +1518,46 @@ export default function App() {
   }
 
   function applyHistoryItem(item: DownloadHistoryItem) {
-    setUrl(item.url || DEFAULT_URL);
+    const historyUrl = item.url?.trim() ?? "";
+
+    queueAuthProbeBatchRef.current += 1;
+    setUrl(historyUrl);
     setOutputDir(item.outputDir || FALLBACK_OUTPUT_DIR);
     setSelectedFormat(item.format || "bv*+ba/b");
     setFailedThumbnail(null);
     setThumbnailLoadStates({});
-    setQueue([
-      {
-        id: crypto.randomUUID(),
-        url: item.url || DEFAULT_URL,
-        title: historyTitle(item),
-        site: historySite(item),
-        duration: null,
-        thumbnail: null,
-        sourceUrl: null,
-        playlistTitle: null,
-        playlistIndex: null,
-        playlistTotal: null,
-        sourceOrder: null,
-        isPlaylistItem: false,
-        status: "idle",
-        progress: 0,
-        error: null,
-      },
-    ]);
+    setQueue(
+      historyUrl
+        ? [
+            {
+              id: crypto.randomUUID(),
+              url: historyUrl,
+              title: historyTitle(item),
+              site: historySite(item),
+              duration: null,
+              thumbnail: null,
+              sourceUrl: null,
+              playlistTitle: null,
+              playlistIndex: null,
+              playlistTotal: null,
+              sourceOrder: null,
+              isPlaylistItem: false,
+              status: "idle",
+              parseError: false,
+              authProbe: {
+                status: "idle",
+                browser,
+                url: historyUrl,
+                site: historySite(item),
+              },
+              progress: 0,
+              phase: null,
+              phaseLabel: null,
+              error: null,
+            },
+          ]
+        : [],
+    );
     setActiveView("download");
   }
 
@@ -1263,6 +1577,7 @@ export default function App() {
   }
 
   function applySupportedSiteExample(example: SupportedSiteExample) {
+    queueAuthProbeBatchRef.current += 1;
     setUrl(example.url);
     setQueue([]);
   }
@@ -1395,8 +1710,15 @@ export default function App() {
                       className="url-textarea"
                       id="video-url"
                       onChange={(event) => {
-                        setUrl(event.target.value);
+                        const nextUrl = event.target.value;
+                        queueAuthProbeBatchRef.current += 1;
+                        setUrl(nextUrl);
                         setQueue([]);
+                        setAuthProbe({
+                          status: "idle",
+                          browser,
+                          url: parseUrlLines(nextUrl)[0] ?? "",
+                        });
                       }}
                       placeholder="每行一个视频或播放列表链接"
                       value={url}
@@ -1424,10 +1746,27 @@ export default function App() {
 
               <div className="form-grid download-options-grid">
                 <div className="field-block">
-                  <Text strong>登录态</Text>
+                  <div className="field-label-row auth-probe-label-row">
+                    <Text strong>登录态</Text>
+                    <AuthProbePanel
+                      browser={browser}
+                      canRefresh={
+                        hasQueueItems ? hasQueueAuthProbeTargets : Boolean(firstUrl)
+                      }
+                      isChecking={
+                        (isProbing && authProbe.status === "checking") ||
+                        isQueueAuthChecking
+                      }
+                      onRefresh={() => {
+                        void handleAuthProbeRefresh();
+                      }}
+                      queueSummary={queueAuthSummary}
+                      state={authProbe}
+                    />
+                  </div>
                   <Segmented
                     block
-                    onChange={(value) => setBrowser(value as BrowserKind)}
+                    onChange={(value) => handleBrowserChange(value as BrowserKind)}
                     options={browserOptions}
                     value={browser}
                   />
@@ -1532,36 +1871,38 @@ export default function App() {
               title={<PanelTitle icon={<DashboardOutlined />} label="下载状态" />}
             >
               <div className="download-status-strip">
-                <div className="download-status-cover">
-                  {currentQueueItem.thumbnail &&
-                  currentThumbnailState?.canRenderImage ? (
-                    <>
-                      <img
-                        alt={currentQueueItem.title}
-                        className={
-                          currentThumbnailState.showImage ? "is-loaded" : ""
-                        }
-                        draggable={false}
-                        key={`${currentQueueItem.id}:${currentQueueItem.thumbnail}:${currentThumbnailState.attempts}`}
-                        onError={() => {
-                          handleThumbnailError(currentQueueItem);
-                        }}
-                        onLoad={() => {
-                          handleThumbnailLoad(currentQueueItem);
-                        }}
-                        referrerPolicy="no-referrer"
-                        src={thumbnailImageSrc(
-                          currentQueueItem,
-                          failedThumbnail,
-                        )}
-                      />
-                      {!currentThumbnailState.showImage ? (
-                        <ThumbnailPlaceholder state={currentThumbnailState} />
-                      ) : null}
-                    </>
-                  ) : (
-                    <ThumbnailPlaceholder state={currentThumbnailState} />
-                  )}
+                <div className="download-status-media">
+                  <div className="download-status-cover">
+                    {currentQueueItem.thumbnail &&
+                    currentThumbnailState?.canRenderImage ? (
+                      <>
+                        <img
+                          alt={currentQueueItem.title}
+                          className={
+                            currentThumbnailState.showImage ? "is-loaded" : ""
+                          }
+                          draggable={false}
+                          key={`${currentQueueItem.id}:${currentQueueItem.thumbnail}:${currentThumbnailState.attempts}`}
+                          onError={() => {
+                            handleThumbnailError(currentQueueItem);
+                          }}
+                          onLoad={() => {
+                            handleThumbnailLoad(currentQueueItem);
+                          }}
+                          referrerPolicy="no-referrer"
+                          src={thumbnailImageSrc(
+                            currentQueueItem,
+                            failedThumbnail,
+                          )}
+                        />
+                        {!currentThumbnailState.showImage ? (
+                          <ThumbnailPlaceholder state={currentThumbnailState} />
+                        ) : null}
+                      </>
+                    ) : (
+                      <ThumbnailPlaceholder state={currentThumbnailState} />
+                    )}
+                  </div>
                 </div>
 
                 <div className="download-status-content">
@@ -1576,7 +1917,15 @@ export default function App() {
                         </Tag>
                       ) : null}
                     </Space>
-                    <Text strong>{Math.round(currentQueueItem.progress)}%</Text>
+                    {currentQueueItem.outputPath ? (
+                      <Button
+                        className="download-status-open-button"
+                        icon={<ExportOutlined />}
+                        onClick={() => revealFile(currentQueueItem.outputPath as string)}
+                      >
+                        打开位置
+                      </Button>
+                    ) : null}
                   </div>
 
                   <Tooltip title={currentQueueItem.title}>
@@ -1585,35 +1934,41 @@ export default function App() {
                     </Text>
                   </Tooltip>
 
-                  <div className="download-status-meta">
-                    <Text type="secondary">{currentQueueItem.site || "-"}</Text>
-                    {currentQueueItem.duration ? (
-                      <Text type="secondary">
-                        {formatDuration(currentQueueItem.duration)}
+                  <div className="download-status-meta-row">
+                    <div className="download-status-meta">
+                      <Text type="secondary">{currentQueueItem.site || "-"}</Text>
+                      {currentQueueItem.duration ? (
+                        <Text type="secondary">
+                          {formatDuration(currentQueueItem.duration)}
+                        </Text>
+                      ) : null}
+                    </div>
+                    <div className="download-status-progress-summary">
+                      <span aria-hidden="true" className="download-status-phase-dot" />
+                      <Text className="download-status-phase-value" strong>
+                        {currentQueueItem.phaseLabel ??
+                          queueStatusCopy(currentQueueItem.status)}
                       </Text>
-                    ) : null}
+                      <Text className="download-status-progress-value" strong>
+                        {Math.round(currentQueueItem.progress)}%
+                      </Text>
+                    </div>
                   </div>
 
-                  <Progress
-                    percent={Math.round(currentQueueItem.progress)}
-                    showInfo={false}
-                    size="small"
-                    status={queueProgressStatus(currentQueueItem.status)}
-                  />
+                  <div className="download-status-progress-row">
+                    <Progress
+                      percent={Math.round(currentQueueItem.progress)}
+                      showInfo={false}
+                      size="small"
+                      status={queueProgressStatus(currentQueueItem.status)}
+                    />
+                  </div>
 
                   <div className="download-status-footer">
                     <div className="download-status-metrics">
                       <Metric label="下载速度" value={currentQueueItem.speed ?? "-"} />
                       <Metric label="剩余时间" value={currentQueueItem.eta ?? "-"} />
                     </div>
-                    {currentQueueItem.outputPath ? (
-                      <Button
-                        icon={<ExportOutlined />}
-                        onClick={() => revealFile(currentQueueItem.outputPath as string)}
-                      >
-                        打开位置
-                      </Button>
-                    ) : null}
                   </div>
                 </div>
               </div>
@@ -1652,6 +2007,7 @@ export default function App() {
                       <Text className="queue-meta" type="secondary">
                         {item.site || "-"} · {item.url}
                       </Text>
+                      <QueueAuthProbeLine item={item} />
                       {item.isPlaylistItem ? (
                         <div className="queue-playlist-meta">
                           <Tag className="queue-playlist-tag">
@@ -2248,6 +2604,116 @@ function SupportedSiteExamples({
   );
 }
 
+function QueueAuthProbeLine({ item }: { item: QueueItem }) {
+  const status = queueItemAuthStatus(item);
+  const tagText = queueItemAuthTagText(item);
+  const details = queueItemAuthDetails(item);
+  const formatText = queueItemBestFormatText(item);
+
+  return (
+    <div className="queue-auth-row">
+      <Popover
+        content={
+          <div className={`queue-auth-popover is-${status}`}>
+            <Text strong>{tagText}</Text>
+            {details ? (
+              <Text className="queue-auth-detail" type="secondary">
+                {details}
+              </Text>
+            ) : null}
+          </div>
+        }
+        placement="topLeft"
+        trigger="hover"
+      >
+        <Tag className={`queue-auth-tag is-${status}`}>{tagText}</Tag>
+      </Popover>
+      {formatText ? (
+        <Text className="queue-auth-format" type="secondary">
+          {formatText}
+        </Text>
+      ) : null}
+    </div>
+  );
+}
+
+function AuthProbePanel({
+  browser,
+  canRefresh,
+  isChecking,
+  onRefresh,
+  queueSummary,
+  state,
+}: {
+  browser: BrowserKind;
+  canRefresh: boolean;
+  isChecking: boolean;
+  onRefresh: () => void;
+  queueSummary?: QueueAuthSummary | null;
+  state: AuthProbeState;
+}) {
+  const isQueueMode = Boolean(queueSummary?.total);
+  const status = queueSummary?.status ?? state.status;
+  const statusText = queueSummary
+    ? queueAuthStatusText(queueSummary)
+    : authProbeStatusText(state);
+  const details = queueSummary
+    ? queueAuthDetails(queueSummary)
+    : authProbeDetails(state);
+  const hint = queueSummary ? queueAuthHint(queueSummary) : authProbeHint(state);
+  const triggerText = queueSummary
+    ? queueAuthTriggerText(queueSummary)
+    : authProbeTriggerText(state);
+
+  return (
+    <div className="auth-probe-controls">
+      <Popover
+        content={
+          <div className={`auth-probe-popover is-${status}`}>
+            <div className="auth-probe-popover-head">
+              <Text strong>
+                {isQueueMode ? "队列登录态详情" : `${browserLabel(browser)} 登录态详情`}
+              </Text>
+            </div>
+            <Text className="auth-probe-status" type="secondary">
+              {statusText}
+            </Text>
+            {details ? (
+              <Text className="auth-probe-details" type="secondary">
+                {details}
+              </Text>
+            ) : null}
+            {hint ? <Text className="auth-probe-hint">{hint}</Text> : null}
+          </div>
+        }
+        placement="bottom"
+        trigger="click"
+      >
+        <Button
+          className={`auth-probe-status-trigger is-${status}`}
+          size="small"
+          type="text"
+        >
+          <span className="auth-probe-dot" aria-hidden="true" />
+          <span className="auth-probe-trigger-text">{triggerText}</span>
+        </Button>
+      </Popover>
+      <Tooltip title="重新检测登录态">
+        <Button
+          aria-label="重新检测登录态"
+          className="auth-probe-refresh-button"
+          disabled={!canRefresh || isChecking}
+          icon={<ReloadOutlined />}
+          loading={isChecking}
+          onClick={onRefresh}
+          size="small"
+          type="text"
+        />
+      </Tooltip>
+    </div>
+  );
+}
+
 function Metric({ label, value }: { label: string; value: string }) {
   return (
     <div className="metric">
@@ -2549,15 +3015,16 @@ function parseUrlLines(value: string) {
     .filter(Boolean);
 }
 
-function queueItemFromParsed(item: BatchParseItem): QueueItem {
+function queueItemFromParsed(item: BatchParseItem, browser: BrowserKind): QueueItem {
   const fallbackTitle = titleFromUrl(item.url);
   const parsedTitle = item.title?.trim();
+  const site = item.site?.trim() || siteFromUrl(item.url) || "未知站点";
 
   return {
     id: item.id || crypto.randomUUID(),
     url: item.url,
     title: parsedTitle || fallbackTitle,
-    site: item.site?.trim() || siteFromUrl(item.url) || "未知站点",
+    site,
     duration: item.duration ?? null,
     thumbnail: item.thumbnail ?? null,
     sourceUrl: item.sourceUrl ?? null,
@@ -2567,7 +3034,25 @@ function queueItemFromParsed(item: BatchParseItem): QueueItem {
     sourceOrder: item.sourceOrder ?? null,
     isPlaylistItem: item.isPlaylistItem,
     status: item.error ? "failed" : "idle",
+    parseError: Boolean(item.error),
+    authProbe: item.error
+      ? queueParseErrorAuthProbe(
+          {
+            url: item.url,
+            site,
+            error: item.error,
+          },
+          browser,
+        )
+      : {
+          status: "idle",
+          browser,
+          url: item.url,
+          site,
+        },
     progress: 0,
+    phase: null,
+    phaseLabel: null,
     speed: null,
     eta: null,
     outputPath: null,
@@ -2596,6 +3081,106 @@ function summarizeQueue(items: QueueItem[]) {
     },
     { completed: 0, running: 0, queued: 0, idle: 0, failed: 0, canceled: 0 },
   );
+}
+
+function summarizeQueueAuth(items: QueueItem[]): QueueAuthSummary | null {
+  if (!items.length) {
+    return null;
+  }
+
+  const summary: QueueAuthSummary = {
+    total: items.length,
+    probeable: 0,
+    ready: 0,
+    warning: 0,
+    unavailable: 0,
+    checking: 0,
+    idle: 0,
+    parseFailed: 0,
+    status: "idle",
+    bestFormatLabel: null,
+    sites: [],
+  };
+  const siteMap = new Map<string, QueueAuthSiteSummary>();
+
+  items.forEach((item) => {
+    const status = queueItemAuthStatus(item);
+    const site = queueItemAuthSite(item);
+    const siteSummary =
+      siteMap.get(site) ??
+      {
+        site,
+        total: 0,
+        ready: 0,
+        warning: 0,
+        unavailable: 0,
+        checking: 0,
+        idle: 0,
+        parseFailed: 0,
+        bestFormatLabel: null,
+        formatCount: null,
+        error: null,
+      };
+
+    siteSummary.total += 1;
+
+    if (item.parseError) {
+      summary.parseFailed += 1;
+      siteSummary.parseFailed += 1;
+      siteSummary.error ??= item.error ?? item.authProbe?.error ?? null;
+    } else {
+      summary.probeable += 1;
+    }
+
+    if (status === "ready") {
+      summary.ready += 1;
+      siteSummary.ready += 1;
+    } else if (status === "warning") {
+      summary.warning += 1;
+      siteSummary.warning += 1;
+    } else if (status === "unavailable") {
+      summary.unavailable += 1;
+      siteSummary.unavailable += 1;
+      siteSummary.error ??= item.authProbe?.error ?? item.error ?? null;
+    } else if (status === "checking") {
+      summary.checking += 1;
+      siteSummary.checking += 1;
+    } else if (status === "failed") {
+      siteSummary.error ??= item.error ?? item.authProbe?.error ?? null;
+    } else {
+      summary.idle += 1;
+      siteSummary.idle += 1;
+    }
+
+    const bestFormatLabel = item.authProbe?.bestFormatLabel ?? null;
+    if (bestFormatLabel) {
+      summary.bestFormatLabel = betterFormatLabel(
+        summary.bestFormatLabel,
+        bestFormatLabel,
+      );
+      siteSummary.bestFormatLabel = betterFormatLabel(
+        siteSummary.bestFormatLabel,
+        bestFormatLabel,
+      );
+    }
+
+    if (item.authProbe?.formatCount) {
+      siteSummary.formatCount = Math.max(
+        siteSummary.formatCount ?? 0,
+        item.authProbe.formatCount,
+      );
+    }
+
+    siteMap.set(site, siteSummary);
+  });
+
+  summary.status = queueAuthSummaryStatus(summary);
+  summary.sites = Array.from(siteMap.values()).map((site) => ({
+    ...site,
+    status: queueAuthSiteStatus(site),
+  }));
+
+  return summary;
 }
 
 function mergeQueueMetadata(item: QueueItem, result: ProbeResponse): QueueItem {
@@ -2849,6 +3434,7 @@ function queueRuntimeMeta(item: QueueItem) {
   }
 
   const parts = [
+    item.phaseLabel ?? null,
     item.speed ? `速度 ${item.speed}` : null,
     item.eta ? `剩余 ${item.eta}` : null,
   ].filter(Boolean);
@@ -2910,6 +3496,408 @@ function parentPath(path: string) {
 
 function readError(value: unknown) {
   return value instanceof Error ? value.message : String(value);
+}
+
+function queueItemCanAuthProbe(item: QueueItem) {
+  return Boolean(item.url.trim()) && !item.parseError;
+}
+
+function queueParseErrorAuthProbe(
+  item: Pick<QueueItem, "url" | "site"> & { error?: string | null },
+  browser: BrowserKind,
+): AuthProbeState {
+  return {
+    status: "failed",
+    browser,
+    url: item.url,
+    site: item.site,
+    error: item.error ?? "解析失败，无法检测登录态。",
+  };
+}
+
+function queueItemAuthStatus(item: QueueItem): AuthProbeStatus {
+  if (item.parseError) {
+    return "failed";
+  }
+
+  return item.authProbe?.status ?? "idle";
+}
+
+function queueItemAuthSite(item: QueueItem) {
+  return (
+    item.authProbe?.site?.trim() ||
+    item.site?.trim() ||
+    siteFromUrl(item.url) ||
+    "未知站点"
+  );
+}
+
+function queueItemAuthTagText(item: QueueItem) {
+  const status = queueItemAuthStatus(item);
+
+  if (status === "checking") {
+    return "检测中";
+  }
+
+  if (status === "ready") {
+    return "登录态可用";
+  }
+
+  if (status === "warning") {
+    return "需注意";
+  }
+
+  if (status === "unavailable") {
+    return "无法检测";
+  }
+
+  if (status === "failed") {
+    return item.parseError ? "解析失败" : "检测失败";
+  }
+
+  return "待检测";
+}
+
+function queueItemBestFormatText(item: QueueItem) {
+  const status = queueItemAuthStatus(item);
+
+  if (status !== "ready" && status !== "warning") {
+    return null;
+  }
+
+  return `最高可下载：${item.authProbe?.bestFormatLabel ?? "未返回明确视频格式"}`;
+}
+
+function queueItemAuthDetails(item: QueueItem) {
+  const status = queueItemAuthStatus(item);
+
+  if (item.parseError) {
+    return item.error ?? item.authProbe?.error ?? "解析失败，无法检测登录态。";
+  }
+
+  if (status === "checking") {
+    return `${queueItemAuthSite(item)} · 正在检测当前浏览器可用格式`;
+  }
+
+  if (status === "unavailable" || status === "failed") {
+    return item.authProbe?.error ?? "当前链接未能完成视频探测。";
+  }
+
+  if (status === "idle") {
+    return `${queueItemAuthSite(item)} · 点击重新检测登录态`;
+  }
+
+  const parts = [
+    queueItemAuthSite(item),
+    item.authProbe?.bestFormatLabel
+      ? `最高可下载：${item.authProbe.bestFormatLabel}`
+      : "最高可下载：未返回明确视频格式",
+    item.authProbe?.formatCount ? `${item.authProbe.formatCount} 个格式` : null,
+    item.authProbe?.checkedAt ? `检测于 ${formatProbeTime(item.authProbe.checkedAt)}` : null,
+  ].filter(Boolean);
+
+  return parts.join(" · ");
+}
+
+function queueAuthSummaryStatus(summary: QueueAuthSummary): AuthProbeStatus {
+  if (summary.checking > 0) {
+    return "checking";
+  }
+
+  if (summary.unavailable > 0 || summary.parseFailed > 0) {
+    return "unavailable";
+  }
+
+  if (summary.warning > 0) {
+    return "warning";
+  }
+
+  if (summary.ready > 0 && summary.idle === 0) {
+    return "ready";
+  }
+
+  return "idle";
+}
+
+function queueAuthSiteStatus(site: QueueAuthSiteSummary): AuthProbeStatus {
+  if (site.checking > 0) {
+    return "checking";
+  }
+
+  if (site.unavailable > 0 || site.parseFailed > 0) {
+    return "unavailable";
+  }
+
+  if (site.warning > 0) {
+    return "warning";
+  }
+
+  if (site.ready > 0 && site.idle === 0) {
+    return "ready";
+  }
+
+  return "idle";
+}
+
+function queueAuthStatusText(summary: QueueAuthSummary) {
+  if (summary.checking > 0) {
+    return `正在检测队列登录态：${summary.ready}/${summary.probeable} 项可用。`;
+  }
+
+  if (summary.unavailable > 0 || summary.parseFailed > 0) {
+    if (summary.probeable === 0) {
+      return `队列链接均解析失败：${summary.parseFailed} 项异常。`;
+    }
+
+    return `队列登录态部分异常：${summary.ready}/${summary.probeable} 项可用，${summary.unavailable + summary.parseFailed} 项异常。`;
+  }
+
+  if (summary.warning > 0) {
+    return `队列登录态需注意：${summary.ready}/${summary.probeable} 项可用，${summary.warning} 项需确认权限。`;
+  }
+
+  if (summary.ready > 0) {
+    if (summary.idle > 0) {
+      return `队列登录态待检测：${summary.ready}/${summary.probeable} 项已检测。`;
+    }
+
+    return `队列登录态可用：${summary.ready}/${summary.probeable} 项已检测。`;
+  }
+
+  return "解析队列后可检测每个链接的登录态。";
+}
+
+function queueAuthTriggerText(summary: QueueAuthSummary) {
+  if (summary.checking > 0) {
+    return "队列检测中";
+  }
+
+  if (summary.unavailable > 0 || summary.parseFailed > 0) {
+    return "队列部分异常";
+  }
+
+  if (summary.warning > 0) {
+    return "队列需注意";
+  }
+
+  if (summary.ready > 0 && summary.idle === 0) {
+    return "队列已检测";
+  }
+
+  return "队列待检测";
+}
+
+function queueAuthDetails(summary: QueueAuthSummary) {
+  const siteDetails = summary.sites
+    .map((site) => {
+      const bestFormat = site.bestFormatLabel
+        ? `最高 ${site.bestFormatLabel}`
+        : site.ready + site.warning > 0
+          ? "最高 未返回明确视频格式"
+          : null;
+      const counts = [
+        site.ready ? `${site.ready} 可用` : null,
+        site.warning ? `${site.warning} 注意` : null,
+        site.checking ? `${site.checking} 检测中` : null,
+        site.unavailable + site.parseFailed
+          ? `${site.unavailable + site.parseFailed} 异常`
+          : null,
+      ].filter(Boolean);
+
+      return [site.site, counts.join("/"), bestFormat].filter(Boolean).join(" · ");
+    })
+    .join("\n");
+
+  const bestFormat = summary.bestFormatLabel
+    ? `队列最高可下载：${summary.bestFormatLabel}`
+    : summary.ready + summary.warning > 0
+      ? "队列最高可下载：未返回明确视频格式"
+      : null;
+
+  return [bestFormat, siteDetails].filter(Boolean).join("\n");
+}
+
+function queueAuthHint(summary: QueueAuthSummary) {
+  if (summary.checking > 0) {
+    return "正在逐项检测当前浏览器登录态和可下载格式。";
+  }
+
+  if (summary.unavailable > 0 || summary.parseFailed > 0) {
+    return "部分队列项无法检测，请查看对应队列行的错误原因。";
+  }
+
+  if (summary.warning > 0) {
+    return "部分链接可能受账号权限、会员或试看限制影响。";
+  }
+
+  return null;
+}
+
+function betterFormatLabel(
+  current?: string | null,
+  candidate?: string | null,
+) {
+  if (!candidate) {
+    return current ?? null;
+  }
+
+  if (!current) {
+    return candidate;
+  }
+
+  return formatLabelScore(candidate) > formatLabelScore(current) ? candidate : current;
+}
+
+function formatLabelScore(value: string) {
+  const text = value.toLowerCase();
+  const resolutionMatch = text.match(/(\d{3,4})p/);
+  const resolution = resolutionMatch ? Number(resolutionMatch[1]) : 0;
+  const bonus = text.includes("4k") || text.includes("2160") ? 2160 : 0;
+
+  return Math.max(resolution, bonus);
+}
+
+function authProbeStateFromResult(
+  result: ProbeResponse,
+  browser: BrowserKind,
+  url: string,
+): AuthProbeState {
+  return {
+    status: "ready",
+    browser: result.checkedBrowser ?? browser,
+    url,
+    site: result.site,
+    title: result.title,
+    duration: result.duration ?? null,
+    bestFormatLabel: result.bestFormatLabel ?? null,
+    formatCount: result.formatCount ?? result.formats.length,
+    checkedAt: result.checkedAt,
+  };
+}
+
+function authProbeStatusText(state: AuthProbeState) {
+  if (!state.url) {
+    return "输入链接后可检测登录态。";
+  }
+
+  if (state.status === "checking") {
+    return "正在读取当前浏览器登录态并探测视频信息。";
+  }
+
+  if (state.status === "failed") {
+    return "登录态检测异常，请检查浏览器账号状态后重试。";
+  }
+
+  if (state.status === "unavailable") {
+    return "无法检测当前链接，请先确认链接有效、网络可用。";
+  }
+
+  if (state.status === "warning") {
+    return "检测到下载结果可能短于真实时长，请检查网站账号权限或重新检测登录态。";
+  }
+
+  if (state.status === "ready") {
+    return "已检测当前浏览器登录态。";
+  }
+
+  return "等待检测当前浏览器登录态。";
+}
+
+function authProbeTriggerText(state: AuthProbeState) {
+  if (!state.url) {
+    return "待检测";
+  }
+
+  if (state.status === "checking") {
+    return "检测中";
+  }
+
+  if (state.status === "failed") {
+    return "检测失败";
+  }
+
+  if (state.status === "unavailable") {
+    return "无法检测";
+  }
+
+  if (state.status === "warning") {
+    return "需注意";
+  }
+
+  if (state.status === "ready") {
+    return "已检测";
+  }
+
+  return "待检测";
+}
+
+function authProbeDetails(state: AuthProbeState) {
+  if (
+    state.status !== "ready" &&
+    state.status !== "warning" &&
+    state.status !== "unavailable"
+  ) {
+    return state.error ?? null;
+  }
+
+  if (state.status === "unavailable") {
+    return state.error ?? null;
+  }
+
+  const parts = [
+    state.site ?? null,
+    state.duration ? formatDuration(state.duration) : null,
+    state.bestFormatLabel ?? null,
+    state.formatCount ? `${state.formatCount} 个格式` : null,
+    state.checkedAt ? `检测于 ${formatProbeTime(state.checkedAt)}` : null,
+  ].filter(Boolean);
+
+  return parts.length ? parts.join(" · ") : null;
+}
+
+function authProbeHint(state: AuthProbeState) {
+  if (state.status === "failed") {
+    return state.error ?? null;
+  }
+
+  if (state.status === "unavailable") {
+    return "当前链接未能完成视频探测，这通常表示链接失效、视频不可访问或网络暂时不可用。";
+  }
+
+  if (state.status !== "warning") {
+    return null;
+  }
+
+  const base =
+    "如果浏览器能看完整内容，但检测到的时长/画质不完整，请检查网站账号状态或重新检测登录态。";
+
+  return isBilibiliSite(state.site, state.url)
+    ? `${base} B 站充电/UPower 内容可能在未读取到登录态时只返回试看流。`
+    : base;
+}
+
+function isBilibiliSite(site?: string | null, url?: string | null) {
+  const value = `${site ?? ""} ${url ?? ""}`.toLowerCase();
+  return value.includes("bilibili") || value.includes("b23.tv");
+}
+
+function browserLabel(browser: BrowserKind) {
+  return browserOptions.find((option) => option.value === browser)?.label ?? browser;
+}
+
+function formatProbeTime(value: string) {
+  const seconds = Number(value);
+  const date = Number.isFinite(seconds) ? new Date(seconds * 1000) : new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return "刚刚";
+  }
+
+  return date.toLocaleTimeString("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
 }
 
 function formatDuration(duration?: number | null) {

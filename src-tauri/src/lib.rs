@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     ffi::OsString,
     fs,
@@ -18,6 +18,7 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager};
 
 const FALLBACK_TOOL_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+const FFMPEG_COMMAND_HISTORY_LIMIT: usize = 500;
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
@@ -168,6 +169,10 @@ struct ProbeResponse {
     duration: Option<f64>,
     thumbnail: Option<String>,
     formats: Vec<FormatOption>,
+    checked_browser: Option<String>,
+    checked_at: String,
+    format_count: usize,
+    best_format_label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -300,11 +305,75 @@ struct ProgressEvent {
     task_id: String,
     status: String,
     progress: f64,
+    phase: Option<String>,
+    phase_label: Option<String>,
     speed: Option<String>,
     eta: Option<String>,
     line: Option<String>,
     output_path: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadPhase {
+    DownloadingVideo,
+    DownloadingAudio,
+    DownloadingMedia,
+    Merging,
+    Completed,
+}
+
+impl DownloadPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DownloadingVideo => "downloadingVideo",
+            Self::DownloadingAudio => "downloadingAudio",
+            Self::DownloadingMedia => "downloadingMedia",
+            Self::Merging => "merging",
+            Self::Completed => "completed",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::DownloadingVideo => "下载视频流",
+            Self::DownloadingAudio => "下载音频流",
+            Self::DownloadingMedia => "下载媒体",
+            Self::Merging => "合并封装中",
+            Self::Completed => "已完成",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedProgress {
+    progress: f64,
+    speed: Option<String>,
+    eta: Option<String>,
+    media_kind: ProgressMediaKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgressMediaKind {
+    Video,
+    Audio,
+    Media,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProgressSnapshot {
+    progress: f64,
+    phase: DownloadPhase,
+}
+
+impl Default for ProgressSnapshot {
+    fn default() -> Self {
+        Self {
+            progress: 0.0,
+            phase: DownloadPhase::DownloadingMedia,
+        }
+    }
 }
 
 #[tauri::command]
@@ -449,6 +518,7 @@ async fn probe_url(
         let state = app.state::<AppState>();
         validate_url(&url)?;
         let yt_dlp_path = ensure_tool(&state, "yt-dlp")?;
+        let checked_browser = normalized_browser(browser);
 
         let mut command = Command::new(&yt_dlp_path);
         apply_tool_env(&state, &mut command);
@@ -460,7 +530,7 @@ async fn probe_url(
             .arg("--socket-timeout")
             .arg("30");
 
-        if let Some(browser) = normalized_browser(browser) {
+        if let Some(browser) = checked_browser.as_deref() {
             command.arg("--cookies-from-browser").arg(browser);
         }
 
@@ -478,6 +548,13 @@ async fn probe_url(
 
         let json: Value = serde_json::from_slice(&output.stdout)
             .map_err(|error| format!("解析 yt-dlp JSON 失败：{error}"))?;
+        let formats = build_format_options(&json);
+        let format_count = json
+            .get("formats")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        let best_format_label = best_format_label(&formats);
 
         Ok(ProbeResponse {
             title: string_field(&json, "title").unwrap_or_else(|| "Untitled video".to_string()),
@@ -487,7 +564,11 @@ async fn probe_url(
             webpage_url: string_field(&json, "webpage_url").unwrap_or(url),
             duration: json.get("duration").and_then(Value::as_f64),
             thumbnail: thumbnail_url(&json),
-            formats: build_format_options(&json),
+            formats,
+            checked_browser,
+            checked_at: unix_timestamp(),
+            format_count,
+            best_format_label,
         })
     })
     .await
@@ -563,7 +644,9 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
             .arg("--progress-delta")
             .arg("0.5")
             .arg("--progress-template")
-            .arg("download:VD_PROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s")
+            .arg("download:VD_PROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(info.vcodec|)s|%(info.acodec|)s|%(info.format_id|)s")
+            .arg("--progress-template")
+            .arg("postprocess:VD_POSTPROCESS:%(progress.status|)s")
             .arg("--no-playlist")
             .arg("--socket-timeout")
             .arg("30")
@@ -643,7 +726,7 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
         let task_for_stderr = task_id.clone();
         let stderr_buffer = Arc::new(Mutex::new(String::new()));
         let stderr_for_thread = Arc::clone(&stderr_buffer);
-        let shared_progress = Arc::new(Mutex::new(0.0));
+        let shared_progress = Arc::new(Mutex::new(ProgressSnapshot::default()));
         let progress_for_stdout = Arc::clone(&shared_progress);
         let progress_for_stderr = Arc::clone(&shared_progress);
 
@@ -662,18 +745,34 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                 buffer.push_str(&line);
 
                 if let Some(parsed) = parse_progress_line(&line) {
-                    if let Ok(mut progress) = progress_for_stderr.lock() {
-                        *progress = parsed.0;
-                    }
-
+                    let snapshot = update_progress_snapshot(&progress_for_stderr, &parsed);
                     let _ = app_for_stderr.emit(
                         "download-progress",
                         ProgressEvent {
                             task_id: task_for_stderr.clone(),
                             status: "running".to_string(),
-                            progress: parsed.0,
-                            speed: parsed.1,
-                            eta: parsed.2,
+                            progress: snapshot.progress,
+                            phase: Some(snapshot.phase.as_str().to_string()),
+                            phase_label: Some(snapshot.phase.label().to_string()),
+                            speed: parsed.speed,
+                            eta: parsed.eta,
+                            line: Some(line.trim().to_string()),
+                            output_path: None,
+                            error: None,
+                        },
+                    );
+                } else if is_merge_progress_line(&line) {
+                    let snapshot = update_merge_snapshot(&progress_for_stderr);
+                    let _ = app_for_stderr.emit(
+                        "download-progress",
+                        ProgressEvent {
+                            task_id: task_for_stderr.clone(),
+                            status: "running".to_string(),
+                            progress: snapshot.progress,
+                            phase: Some(snapshot.phase.as_str().to_string()),
+                            phase_label: Some(snapshot.phase.label().to_string()),
+                            speed: None,
+                            eta: None,
                             line: Some(line.trim().to_string()),
                             output_path: None,
                             error: None,
@@ -699,18 +798,36 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                 }
 
                 if let Some(parsed) = parse_progress_line(&line) {
-                    progress = parsed.0;
-                    if let Ok(mut shared) = progress_for_stdout.lock() {
-                        *shared = progress;
-                    }
+                    let snapshot = update_progress_snapshot(&progress_for_stdout, &parsed);
+                    progress = snapshot.progress;
                     let _ = app_for_stdout.emit(
                         "download-progress",
                         ProgressEvent {
                             task_id: task_for_stdout.clone(),
                             status: "running".to_string(),
                             progress,
-                            speed: parsed.1,
-                            eta: parsed.2,
+                            phase: Some(snapshot.phase.as_str().to_string()),
+                            phase_label: Some(snapshot.phase.label().to_string()),
+                            speed: parsed.speed,
+                            eta: parsed.eta,
+                            line: Some(line),
+                            output_path: output_path.clone(),
+                            error: None,
+                        },
+                    );
+                } else if is_merge_progress_line(&line) {
+                    let snapshot = update_merge_snapshot(&progress_for_stdout);
+                    progress = snapshot.progress;
+                    let _ = app_for_stdout.emit(
+                        "download-progress",
+                        ProgressEvent {
+                            task_id: task_for_stdout.clone(),
+                            status: "running".to_string(),
+                            progress,
+                            phase: Some(snapshot.phase.as_str().to_string()),
+                            phase_label: Some(snapshot.phase.label().to_string()),
+                            speed: None,
+                            eta: None,
                             line: Some(line),
                             output_path: output_path.clone(),
                             error: None,
@@ -730,7 +847,7 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
             } else {
                 progress = shared_progress
                     .lock()
-                    .map(|progress| *progress)
+                    .map(|snapshot| snapshot.progress)
                     .unwrap_or(progress);
                 "failed"
             };
@@ -747,6 +864,11 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
             } else {
                 None
             };
+            let final_phase = if final_status == "completed" {
+                Some(DownloadPhase::Completed)
+            } else {
+                shared_progress.lock().ok().map(|snapshot| snapshot.phase)
+            };
 
             let _ = app_for_stdout.emit(
                 "download-progress",
@@ -754,6 +876,8 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                     task_id: task_for_stdout.clone(),
                     status: final_status.to_string(),
                     progress,
+                    phase: final_phase.map(|phase| phase.as_str().to_string()),
+                    phase_label: final_phase.map(|phase| phase.label().to_string()),
                     speed: None,
                     eta: None,
                     line: None,
@@ -817,6 +941,8 @@ async fn cancel_download(app: AppHandle, task_id: String) -> Result<(), String> 
                 task_id,
                 status: "canceled".to_string(),
                 progress: 0.0,
+                phase: None,
+                phase_label: None,
                 speed: None,
                 eta: None,
                 line: None,
@@ -2133,6 +2259,16 @@ fn build_format_options(json: &Value) -> Vec<FormatOption> {
     options
 }
 
+fn best_format_label(formats: &[FormatOption]) -> Option<String> {
+    formats
+        .iter()
+        .find(|format| {
+            !matches!(format.id.as_str(), "best" | "best-mp4" | "audio")
+                && format.resolution.as_deref() != Some("audio")
+        })
+        .map(|format| format.label.clone())
+}
+
 fn format_from_json(format: &Value) -> Option<FormatOption> {
     let id = string_field(format, "format_id")?;
     let ext = string_field(format, "ext");
@@ -2183,7 +2319,82 @@ fn resolution_score(resolution: Option<&str>) -> u64 {
     digits.parse().unwrap_or(0)
 }
 
-fn parse_progress_line(line: &str) -> Option<(f64, Option<String>, Option<String>)> {
+fn update_progress_snapshot(
+    progress: &Arc<Mutex<ProgressSnapshot>>,
+    parsed: &ParsedProgress,
+) -> ProgressSnapshot {
+    let mapped = map_download_progress(parsed.progress, parsed.media_kind);
+    let phase = progress_phase(parsed.media_kind);
+
+    progress
+        .lock()
+        .map(|mut snapshot| {
+            let should_update_phase =
+                mapped >= snapshot.progress || phase_rank(phase) > phase_rank(snapshot.phase);
+            snapshot.progress = snapshot.progress.max(mapped).min(99.0);
+            if should_update_phase {
+                snapshot.phase = phase;
+            }
+            *snapshot
+        })
+        .unwrap_or(ProgressSnapshot {
+            progress: mapped,
+            phase,
+        })
+}
+
+fn update_merge_snapshot(progress: &Arc<Mutex<ProgressSnapshot>>) -> ProgressSnapshot {
+    progress
+        .lock()
+        .map(|mut snapshot| {
+            snapshot.progress = snapshot.progress.max(99.0);
+            snapshot.phase = DownloadPhase::Merging;
+            *snapshot
+        })
+        .unwrap_or(ProgressSnapshot {
+            progress: 99.0,
+            phase: DownloadPhase::Merging,
+        })
+}
+
+fn map_download_progress(progress: f64, media_kind: ProgressMediaKind) -> f64 {
+    let progress = progress.clamp(0.0, 100.0);
+
+    match media_kind {
+        ProgressMediaKind::Video => progress * 0.5,
+        ProgressMediaKind::Audio => 50.0 + progress * 0.49,
+        ProgressMediaKind::Media | ProgressMediaKind::Unknown => progress * 0.99,
+    }
+}
+
+fn progress_phase(media_kind: ProgressMediaKind) -> DownloadPhase {
+    match media_kind {
+        ProgressMediaKind::Video => DownloadPhase::DownloadingVideo,
+        ProgressMediaKind::Audio => DownloadPhase::DownloadingAudio,
+        ProgressMediaKind::Media | ProgressMediaKind::Unknown => DownloadPhase::DownloadingMedia,
+    }
+}
+
+fn phase_rank(phase: DownloadPhase) -> u8 {
+    match phase {
+        DownloadPhase::DownloadingMedia => 0,
+        DownloadPhase::DownloadingVideo => 1,
+        DownloadPhase::DownloadingAudio => 2,
+        DownloadPhase::Merging => 3,
+        DownloadPhase::Completed => 4,
+    }
+}
+
+fn is_merge_progress_line(line: &str) -> bool {
+    let line = strip_ansi_codes(line);
+    let line = line.trim();
+
+    line.starts_with("VD_POSTPROCESS:")
+        || line.starts_with("[Merger]")
+        || line.contains("Merging formats into")
+}
+
+fn parse_progress_line(line: &str) -> Option<ParsedProgress> {
     let line = strip_ansi_codes(line);
 
     if let Some(progress_line) = line.trim().strip_prefix("VD_PROGRESS:") {
@@ -2206,16 +2417,52 @@ fn parse_progress_line(line: &str) -> Option<(f64, Option<String>, Option<String
         extract_after(&line, " at ", " ETA ").and_then(|value| normalize_progress_value(&value));
     let eta = line.split(" ETA ").nth(1).and_then(normalize_eta_value);
 
-    Some((progress, speed, eta))
+    Some(ParsedProgress {
+        progress,
+        speed,
+        eta,
+        media_kind: ProgressMediaKind::Unknown,
+    })
 }
 
-fn parse_machine_progress_line(line: &str) -> Option<(f64, Option<String>, Option<String>)> {
+fn parse_machine_progress_line(line: &str) -> Option<ParsedProgress> {
     let mut fields = line.split('|');
     let progress = fields.next().and_then(parse_percent_value)?;
     let speed = fields.next().and_then(normalize_progress_value);
     let eta = fields.next().and_then(normalize_eta_value);
+    let vcodec = fields.next().and_then(normalize_progress_value);
+    let acodec = fields.next().and_then(normalize_progress_value);
+    let _format_id = fields.next().and_then(normalize_progress_value);
 
-    Some((progress, speed, eta))
+    Some(ParsedProgress {
+        progress,
+        speed,
+        eta,
+        media_kind: progress_media_kind(vcodec.as_deref(), acodec.as_deref()),
+    })
+}
+
+fn progress_media_kind(vcodec: Option<&str>, acodec: Option<&str>) -> ProgressMediaKind {
+    let has_video = vcodec.is_some_and(is_real_codec);
+    let has_audio = acodec.is_some_and(is_real_codec);
+
+    match (has_video, has_audio) {
+        (true, false) => ProgressMediaKind::Video,
+        (false, true) => ProgressMediaKind::Audio,
+        (true, true) => ProgressMediaKind::Media,
+        (false, false) => ProgressMediaKind::Unknown,
+    }
+}
+
+fn is_real_codec(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+
+    !value.is_empty()
+        && value != "none"
+        && value != "null"
+        && value != "unknown"
+        && value != "n/a"
+        && value != "na"
 }
 
 fn parse_percent_value(value: &str) -> Option<f64> {
@@ -2289,17 +2536,21 @@ mod tests {
 
     #[test]
     fn parses_machine_progress_line() {
-        let parsed = parse_progress_line("VD_PROGRESS: 12.3%|8.4MiB/s|00:42").unwrap();
+        let parsed =
+            parse_progress_line("VD_PROGRESS: 12.3%|8.4MiB/s|00:42|h264|none|137").unwrap();
 
-        assert_eq!(parsed.0, 12.3);
-        assert_eq!(parsed.1.as_deref(), Some("8.4MiB/s"));
-        assert_eq!(parsed.2.as_deref(), Some("00:42"));
+        assert_eq!(parsed.progress, 12.3);
+        assert_eq!(parsed.speed.as_deref(), Some("8.4MiB/s"));
+        assert_eq!(parsed.eta.as_deref(), Some("00:42"));
+        assert_eq!(parsed.media_kind, ProgressMediaKind::Video);
 
-        let parsed = parse_progress_line("VD_PROGRESS: 40%|Unknown B/s|Unknown ETA").unwrap();
+        let parsed =
+            parse_progress_line("VD_PROGRESS: 40%|Unknown B/s|Unknown ETA|none|opus|251").unwrap();
 
-        assert_eq!(parsed.0, 40.0);
-        assert_eq!(parsed.1, None);
-        assert_eq!(parsed.2, None);
+        assert_eq!(parsed.progress, 40.0);
+        assert_eq!(parsed.speed, None);
+        assert_eq!(parsed.eta, None);
+        assert_eq!(parsed.media_kind, ProgressMediaKind::Audio);
     }
 
     #[test]
@@ -2309,9 +2560,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(parsed.0, 35.2);
-        assert_eq!(parsed.1.as_deref(), Some("3.1MiB/s"));
-        assert_eq!(parsed.2.as_deref(), Some("00:25"));
+        assert_eq!(parsed.progress, 35.2);
+        assert_eq!(parsed.speed.as_deref(), Some("3.1MiB/s"));
+        assert_eq!(parsed.eta.as_deref(), Some("00:25"));
+        assert_eq!(parsed.media_kind, ProgressMediaKind::Unknown);
     }
 
     #[test]
@@ -2319,17 +2571,117 @@ mod tests {
         let parsed =
             parse_progress_line("[download] 100% of 120.00MiB in 00:30 at 4.0MiB/s").unwrap();
 
-        assert_eq!(parsed.0, 100.0);
-        assert_eq!(parsed.1.as_deref(), Some("4.0MiB/s"));
-        assert_eq!(parsed.2, None);
+        assert_eq!(parsed.progress, 100.0);
+        assert_eq!(parsed.speed.as_deref(), Some("4.0MiB/s"));
+        assert_eq!(parsed.eta, None);
     }
 
     #[test]
     fn ignores_non_progress_lines() {
-        assert_eq!(parse_progress_line("[info] Extracting URL"), None);
+        assert!(parse_progress_line("[info] Extracting URL").is_none());
+        assert!(parse_progress_line("VD_PROGRESS: Unknown|N/A|Unknown").is_none());
+    }
+
+    #[test]
+    fn maps_split_stream_progress_to_single_total_progress() {
+        assert_eq!(map_download_progress(0.0, ProgressMediaKind::Video), 0.0);
+        assert_eq!(map_download_progress(50.0, ProgressMediaKind::Video), 25.0);
+        assert_eq!(map_download_progress(100.0, ProgressMediaKind::Video), 50.0);
+
+        assert_eq!(map_download_progress(0.0, ProgressMediaKind::Audio), 50.0);
+        assert_eq!(map_download_progress(50.0, ProgressMediaKind::Audio), 74.5);
+        assert_eq!(map_download_progress(100.0, ProgressMediaKind::Audio), 99.0);
+    }
+
+    #[test]
+    fn merge_lines_hold_progress_at_ninety_nine() {
+        assert!(is_merge_progress_line(
+            "[Merger] Merging formats into \"video.mp4\""
+        ));
+        assert!(is_merge_progress_line("VD_POSTPROCESS:started"));
+
+        let progress = Arc::new(Mutex::new(ProgressSnapshot {
+            progress: 74.5,
+            phase: DownloadPhase::DownloadingAudio,
+        }));
+        let snapshot = update_merge_snapshot(&progress);
+
+        assert_eq!(snapshot.progress, 99.0);
+        assert_eq!(snapshot.phase, DownloadPhase::Merging);
+    }
+
+    #[test]
+    fn progress_snapshot_never_regresses_between_streams() {
+        let progress = Arc::new(Mutex::new(ProgressSnapshot::default()));
+        let video = ParsedProgress {
+            progress: 100.0,
+            speed: None,
+            eta: None,
+            media_kind: ProgressMediaKind::Video,
+        };
+        let audio_start = ParsedProgress {
+            progress: 0.0,
+            speed: None,
+            eta: None,
+            media_kind: ProgressMediaKind::Audio,
+        };
+
+        assert_eq!(update_progress_snapshot(&progress, &video).progress, 50.0);
+        let snapshot = update_progress_snapshot(&progress, &audio_start);
+
+        assert_eq!(snapshot.progress, 50.0);
+        assert_eq!(snapshot.phase, DownloadPhase::DownloadingAudio);
+
+        let stale_video = ParsedProgress {
+            progress: 80.0,
+            speed: None,
+            eta: None,
+            media_kind: ProgressMediaKind::Video,
+        };
+        let snapshot = update_progress_snapshot(&progress, &stale_video);
+
+        assert_eq!(snapshot.progress, 50.0);
+        assert_eq!(snapshot.phase, DownloadPhase::DownloadingAudio);
+    }
+
+    #[test]
+    fn best_format_label_uses_first_real_video_format() {
+        let formats = vec![
+            FormatOption {
+                id: "best".to_string(),
+                label: "最佳画质 + 最佳音频".to_string(),
+                selector: "bv*+ba/b".to_string(),
+                ext: Some("mp4".to_string()),
+                resolution: Some("自动".to_string()),
+                vcodec: None,
+                acodec: None,
+                filesize: None,
+            },
+            FormatOption {
+                id: "audio".to_string(),
+                label: "仅音频".to_string(),
+                selector: "ba".to_string(),
+                ext: None,
+                resolution: Some("audio".to_string()),
+                vcodec: None,
+                acodec: None,
+                filesize: None,
+            },
+            FormatOption {
+                id: "30121".to_string(),
+                label: "3840x1634 · mp4 · hev1.1.6.L153".to_string(),
+                selector: "30121+bestaudio/best".to_string(),
+                ext: Some("mp4".to_string()),
+                resolution: Some("3840x1634".to_string()),
+                vcodec: Some("hev1.1.6.L153".to_string()),
+                acodec: Some("none".to_string()),
+                filesize: Some(2_400_000_000),
+            },
+        ];
+
         assert_eq!(
-            parse_progress_line("VD_PROGRESS: Unknown|N/A|Unknown"),
-            None
+            best_format_label(&formats).as_deref(),
+            Some("3840x1634 · mp4 · hev1.1.6.L153")
         );
     }
 }
@@ -2453,8 +2805,7 @@ fn write_ffmpeg_command_history_unlocked(items: &[FfmpegCommandHistoryItem]) -> 
 
     let bytes = serde_json::to_vec_pretty(items)
         .map_err(|error| format!("序列化 FFmpeg 命令历史失败：{error}"))?;
-    fs::write(&path, bytes)
-        .map_err(|error| format!("写入 FFmpeg 命令历史失败 {}：{error}", path.display()))
+    write_file_atomic(&path, &bytes, "FFmpeg 命令历史")
 }
 
 fn append_ffmpeg_command_history_item(
@@ -2466,25 +2817,26 @@ fn append_ffmpeg_command_history_item(
         .lock()
         .map_err(|_| "FFmpeg 命令历史记录锁已损坏。".to_string())?;
     let mut items = read_ffmpeg_command_history_unlocked()?;
-    items.insert(
-        0,
-        FfmpegCommandHistoryItem {
-            id: uuid_like_id(),
-            preset_id: input.preset_id,
-            input_path: input.input_path,
-            secondary_input_path: input.secondary_input_path,
-            output_dir: input.output_dir,
-            audio_format: input.audio_format,
-            start_time: input.start_time,
-            end_time: input.end_time,
-            crf: input.crf,
-            command: input.command,
-            working_dir: input.working_dir,
-            output_path: input.output_path,
-            created_at: unix_timestamp(),
-        },
-    );
+    let next_item = FfmpegCommandHistoryItem {
+        id: uuid_like_id(),
+        preset_id: input.preset_id,
+        input_path: input.input_path,
+        secondary_input_path: input.secondary_input_path,
+        output_dir: input.output_dir,
+        audio_format: input.audio_format,
+        start_time: input.start_time,
+        end_time: input.end_time,
+        crf: input.crf,
+        command: input.command,
+        working_dir: input.working_dir,
+        output_path: input.output_path,
+        created_at: unix_timestamp(),
+    };
+
+    items.retain(|item| item.command != next_item.command);
+    items.insert(0, next_item);
     sort_ffmpeg_command_history(&mut items);
+    items.truncate(FFMPEG_COMMAND_HISTORY_LIMIT);
     write_ffmpeg_command_history_unlocked(&items)?;
     Ok(items)
 }
@@ -2504,7 +2856,7 @@ fn delete_ffmpeg_command_history_by_ids(
         return Ok(items);
     }
 
-    let selected: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let selected: HashSet<&str> = ids.iter().map(String::as_str).collect();
     let mut items = read_ffmpeg_command_history_unlocked()?;
     items.retain(|item| !selected.contains(item.id.as_str()));
     sort_ffmpeg_command_history(&mut items);
@@ -2522,6 +2874,40 @@ fn clear_ffmpeg_command_history_items(state: &AppState) -> Result<(), String> {
 
 fn sort_ffmpeg_command_history(items: &mut [FfmpegCommandHistoryItem]) {
     items.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+}
+
+fn write_file_atomic(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("data.json");
+    let temp_name = format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let temp_path = path.with_file_name(temp_name);
+
+    let write_result = (|| {
+        let mut file = fs::File::create(&temp_path).map_err(|error| {
+            format!("创建 {label} 临时文件失败 {}：{error}", temp_path.display())
+        })?;
+        file.write_all(bytes).map_err(|error| {
+            format!("写入 {label} 临时文件失败 {}：{error}", temp_path.display())
+        })?;
+        file.sync_all().map_err(|error| {
+            format!("同步 {label} 临时文件失败 {}：{error}", temp_path.display())
+        })?;
+        drop(file);
+        fs::rename(&temp_path, path)
+            .map_err(|error| format!("替换 {label} 文件失败 {}：{error}", path.display()))
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    write_result
 }
 
 fn delete_history_item_by_id(state: &AppState, id: &str, delete_file: bool) -> Result<(), String> {

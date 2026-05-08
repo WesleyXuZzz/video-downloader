@@ -733,6 +733,155 @@ body {
   background: rgba(22, 119, 255, 0.1) !important;
 }
 
+.auth-probe-label-row {
+  align-items: center;
+  gap: 6px;
+}
+
+.auth-probe-controls {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.auth-probe-status-trigger.ant-btn {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 22px;
+  padding: 0 6px;
+  color: #475569;
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+.auth-probe-status-trigger.ant-btn:hover {
+  background: #f8fafc !important;
+}
+
+.auth-probe-status-trigger.is-ready.ant-btn {
+  color: #237804;
+}
+
+.auth-probe-status-trigger.is-warning.ant-btn {
+  color: #8a5a00;
+}
+
+.auth-probe-status-trigger.is-failed.ant-btn {
+  color: #a8071a;
+}
+
+.auth-probe-status-trigger.is-unavailable.ant-btn {
+  color: #475569;
+}
+
+.auth-probe-status-trigger.is-checking.ant-btn {
+  color: #0958d9;
+}
+
+.auth-probe-refresh-button.ant-btn {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 24px;
+  color: #475569;
+  border-radius: 999px;
+}
+
+.auth-probe-refresh-button.ant-btn:not(:disabled):hover {
+  color: var(--primary) !important;
+  background: #f1f5f9 !important;
+}
+
+.auth-probe-trigger-text {
+  overflow: hidden;
+  min-width: 0;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auth-probe-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  background: #94a3b8;
+  border-radius: 999px;
+}
+
+.auth-probe-status-trigger.is-checking .auth-probe-dot {
+  background: #1677ff;
+}
+
+.auth-probe-status-trigger.is-ready .auth-probe-dot {
+  background: #52c41a;
+}
+
+.auth-probe-status-trigger.is-warning .auth-probe-dot {
+  background: #faad14;
+}
+
+.auth-probe-status-trigger.is-failed .auth-probe-dot {
+  background: #ff4d4f;
+}
+
+.auth-probe-status-trigger.is-unavailable .auth-probe-dot {
+  background: #94a3b8;
+}
+
+.auth-probe-popover {
+  display: grid;
+  gap: 8px;
+  width: min(360px, calc(100vw - 48px));
+}
+
+.auth-probe-popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.auth-probe-status,
+.auth-probe-details,
+.auth-probe-hint {
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.auth-probe-status.ant-typography,
+.auth-probe-details.ant-typography {
+  display: block;
+  white-space: pre-line;
+}
+
+.auth-probe-hint.ant-typography {
+  color: #8a5a00;
+}
+
+.auth-probe-hint.ant-typography {
+  display: block;
+}
+
+.auth-probe-popover .auth-probe-hint.ant-typography {
+  white-space: normal;
+}
+
+.auth-probe-popover.is-failed .auth-probe-hint.ant-typography {
+  color: #a8071a;
+}
+
+.auth-probe-popover.is-unavailable .auth-probe-hint.ant-typography {
+  color: #475569;
+}
+
 .download-workbench {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
@@ -1467,6 +1616,13 @@ body {
   align-items: stretch;
 }
 
+.download-status-media {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  align-content: start;
+}
+
 .download-status-cover {
   display: grid;
   position: relative;
@@ -1480,6 +1636,25 @@ body {
   border-radius: 8px;
   font-size: 32px;
   place-items: center;
+}
+
+.download-status-phase-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  background: #52c41a;
+  border-radius: 999px;
+  box-shadow: 0 0 0 3px rgba(82, 196, 26, 0.12);
+}
+
+.download-status-phase-value.ant-typography {
+  overflow: hidden;
+  min-width: 0;
+  color: #237804;
+  font-size: 12px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .download-status-cover img {
@@ -1548,7 +1723,8 @@ body {
 
 .download-status-heading,
 .download-status-footer,
-.download-status-meta {
+.download-status-meta,
+.download-status-meta-row {
   display: flex;
   align-items: center;
   min-width: 0;
@@ -1558,6 +1734,10 @@ body {
 .download-status-footer {
   justify-content: space-between;
   gap: 12px;
+}
+
+.download-status-open-button.ant-btn {
+  flex: 0 0 auto;
 }
 
 .download-status-title {
@@ -1574,6 +1754,20 @@ body {
   gap: 8px;
 }
 
+.download-status-meta-row {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.download-status-progress-summary {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  min-width: 150px;
+  max-width: 45%;
+}
+
 .download-status-meta .ant-typography {
   overflow: hidden;
   min-width: 0;
@@ -1581,16 +1775,29 @@ body {
   white-space: nowrap;
 }
 
+.download-status-progress-row {
+  min-width: 0;
+}
+
+.download-status-progress-row .ant-progress {
+  min-width: 0;
+}
+
+.download-status-progress-value.ant-typography {
+  flex: 0 0 48px;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 .download-status-metrics {
   display: grid;
   grid-template-columns: repeat(2, minmax(118px, 1fr));
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
   flex: 1;
-}
-
-.download-status-footer > .ant-btn {
-  flex: 0 0 auto;
 }
 
 .queue-card .ant-card-body {
@@ -1688,11 +1895,74 @@ body {
 
 .queue-meta,
 .queue-runtime-meta,
+.queue-auth-format,
 .queue-error {
   overflow: hidden;
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.queue-auth-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+}
+
+.queue-auth-tag.ant-tag {
+  flex: 0 0 auto;
+  margin-inline-end: 0;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.queue-auth-tag.is-idle.ant-tag {
+  color: #475569;
+  background: #f8fafc;
+  border-color: #e2e8f0;
+}
+
+.queue-auth-tag.is-checking.ant-tag {
+  color: #0958d9;
+  background: #e6f4ff;
+  border-color: #91caff;
+}
+
+.queue-auth-tag.is-ready.ant-tag {
+  color: #237804;
+  background: #f6ffed;
+  border-color: #b7eb8f;
+}
+
+.queue-auth-tag.is-warning.ant-tag {
+  color: #8a5a00;
+  background: #fff7e6;
+  border-color: #ffd591;
+}
+
+.queue-auth-tag.is-unavailable.ant-tag,
+.queue-auth-tag.is-failed.ant-tag {
+  color: #a8071a;
+  background: #fff1f0;
+  border-color: #ffa39e;
+}
+
+.queue-auth-format.ant-typography {
+  min-width: 0;
+}
+
+.queue-auth-popover {
+  display: grid;
+  gap: 6px;
+  max-width: min(360px, calc(100vw - 48px));
+}
+
+.queue-auth-detail.ant-typography {
+  display: block;
+  overflow-wrap: anywhere;
+  white-space: pre-line;
 }
 
 .queue-playlist-meta {
@@ -1885,8 +2155,8 @@ body {
 .metric {
   display: grid;
   min-width: 0;
-  gap: 4px;
-  padding: 10px 12px;
+  gap: 2px;
+  padding: 8px 10px;
   background: #f7f9fc;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -1900,6 +2170,7 @@ body {
   overflow: hidden;
   color: var(--ink);
   font-size: 14px;
+  line-height: 1.25;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2168,12 +2439,21 @@ body {
     align-items: flex-start;
   }
 
-  .download-status-metrics {
-    width: 100%;
-    grid-template-columns: 1fr;
+  .download-status-meta-row {
+    align-items: flex-start;
+    flex-wrap: wrap;
   }
 
-  .download-status-footer > .ant-btn {
+  .download-status-progress-summary {
+    max-width: 100%;
+  }
+
+  .download-status-metrics {
+    width: 100%;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .download-status-open-button.ant-btn {
     width: 100%;
   }
 

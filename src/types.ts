@@ -13,6 +13,13 @@ export type DownloadStatus =
 
 export type DownloadQueueStatus = DownloadStatus | "queued";
 
+export type DownloadPhase =
+  | "downloadingVideo"
+  | "downloadingAudio"
+  | "downloadingMedia"
+  | "merging"
+  | "completed";
+
 export type FfmpegPresetId =
   | "convertMp4"
   | "compress"
@@ -73,6 +80,10 @@ export interface ProbeResponse {
   duration?: number | null;
   thumbnail?: string | null;
   formats: FormatOption[];
+  checkedBrowser?: BrowserKind | null;
+  checkedAt: string;
+  formatCount: number;
+  bestFormatLabel?: string | null;
 }
 
 export interface DownloadRequest {
@@ -120,6 +131,8 @@ export interface ProgressEvent {
   taskId: string;
   status: DownloadStatus;
   progress: number;
+  phase?: DownloadPhase | null;
+  phaseLabel?: string | null;
   speed?: string | null;
   eta?: string | null;
   line?: string | null;
@@ -144,18 +157,24 @@ export interface FfmpegCommandDraft {
   outputPath: string;
 }
 
-export interface FfmpegCommandHistoryItem extends FfmpegCommandRequest {
+export interface FfmpegCommandHistoryItem {
   id: string;
+  presetId: string;
+  inputPath: string;
+  secondaryInputPath?: string | null;
+  outputDir: string;
+  audioFormat?: "mp3" | "m4a" | null;
+  startTime?: string | null;
+  endTime?: string | null;
+  crf?: number | null;
   command: string;
   workingDir: string;
   outputPath: string;
   createdAt: string;
 }
 
-export type FfmpegCommandHistoryInput = Omit<
-  FfmpegCommandHistoryItem,
-  "id" | "createdAt"
->;
+export type FfmpegCommandHistoryInput = FfmpegCommandRequest &
+  Omit<FfmpegCommandHistoryItem, "id" | "createdAt" | keyof FfmpegCommandRequest>;
 
 export interface TerminalPrefillResult {
   prefilled: boolean;

@@ -171,6 +171,10 @@ export async function probeUrl(
       webpageUrl: url,
       duration: 482,
       thumbnail: null,
+      checkedBrowser: browser,
+      checkedAt: String(Math.floor(Date.now() / 1000)),
+      formatCount: 3,
+      bestFormatLabel: "1080p · mp4 · h264",
       formats: [
         {
           id: "best",
@@ -490,10 +494,28 @@ function runMockDownload(taskId: string) {
   let progress = 0;
   const timer = window.setInterval(() => {
     progress = Math.min(100, progress + 7 + Math.random() * 9);
+    const phase =
+      progress >= 100
+        ? "completed"
+        : progress >= 99
+          ? "merging"
+          : progress >= 50
+            ? "downloadingAudio"
+            : "downloadingVideo";
+    const phaseLabel =
+      phase === "completed"
+        ? "已完成"
+        : phase === "merging"
+          ? "合并封装中"
+          : phase === "downloadingAudio"
+            ? "下载音频流"
+            : "下载视频流";
     emitMock({
       taskId,
       status: progress >= 100 ? "completed" : "running",
       progress,
+      phase,
+      phaseLabel,
       speed: progress >= 100 ? null : "8.4MiB/s",
       eta: progress >= 100 ? null : "00:12",
       outputPath:
