@@ -1201,6 +1201,19 @@ body {
   border-radius: 0 8px 8px 0;
 }
 
+.url-probe-button.is-stop.ant-btn {
+  color: #ffffff;
+  background: #cf1322;
+  border-color: #cf1322;
+}
+
+.url-probe-button.is-stop.ant-btn:hover,
+.url-probe-button.is-stop.ant-btn:focus-visible {
+  color: #ffffff;
+  background: #a8071a;
+  border-color: #a8071a;
+}
+
 .path-picker-button.ant-btn {
   font-weight: 700;
 }
@@ -2144,6 +2157,12 @@ body {
   border-color: #91caff;
 }
 
+.queue-status-tag.is-paused.ant-tag {
+  color: #ad6800;
+  background: #fff7e6;
+  border-color: #ffd591;
+}
+
 .queue-status-tag.is-completed.ant-tag {
   color: #237804;
   background: #f6ffed;
@@ -2366,6 +2385,21 @@ body {
   box-shadow: none;
 }
 
+.queue-pause-button.ant-btn {
+  color: #ad6800;
+  background: #fff7e6;
+  border-color: #ffd591;
+  box-shadow: none;
+}
+
+.queue-pause-button.ant-btn:hover,
+.queue-pause-button.ant-btn:focus-visible {
+  color: #874d00;
+  background: #ffe7ba;
+  border-color: #ffc069;
+  box-shadow: none;
+}
+
 .queue-remove-button.ant-btn {
   width: 42px;
   min-width: 42px;
@@ -2462,6 +2496,33 @@ body {
 
 .history-page-error {
   overflow-wrap: anywhere;
+}
+
+.cleanup-confirm {
+  display: grid;
+  gap: 12px;
+}
+
+.cleanup-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.cleanup-metric {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 10px 12px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+.cleanup-metric .ant-typography-strong {
+  color: var(--ink);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
 }
 
 .history-page-actions {

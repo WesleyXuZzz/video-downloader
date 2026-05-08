@@ -21,11 +21,14 @@ const FALLBACK_TOOL_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/u
 const FFMPEG_COMMAND_HISTORY_LIMIT: usize = 500;
 const DEFAULT_YTDLP_FORMAT_SELECTOR: &str = "bv*+ba/b";
 const YTDLP_OPERATION_CANCELED_MESSAGE: &str = "操作已停止。";
+const DOWNLOAD_CACHE_DIR_NAME: &str = "download-cache";
+const STALE_ACTIVE_HISTORY_SECONDS: u64 = 24 * 60 * 60;
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct AppState {
     tasks: Mutex<HashMap<String, TaskControl>>,
+    paused_tasks: Mutex<HashSet<String>>,
     ytdlp_operations: Mutex<HashMap<String, YtdlpOperationControl>>,
     history_lock: Mutex<()>,
     ffmpeg_command_history_lock: Mutex<()>,
@@ -36,6 +39,7 @@ struct AppState {
 struct TaskControl {
     child: Arc<Mutex<Child>>,
     canceled: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -353,6 +357,23 @@ struct ProgressEvent {
     local_media: Option<LocalMediaInfo>,
     media_comparison: Option<MediaComparison>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct DownloadCleanupSummary {
+    file_count: u64,
+    directory_count: u64,
+    bytes: u64,
+    invalid_history_count: u64,
+    skipped_active_tasks: u64,
+}
+
+#[derive(Debug, Default)]
+struct DownloadCleanupPlan {
+    summary: DownloadCleanupSummary,
+    cache_dirs: Vec<PathBuf>,
+    invalid_history_ids: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -755,6 +776,12 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
         let output_dir = PathBuf::from(&request.output_dir);
         fs::create_dir_all(&output_dir)
             .map_err(|error| format!("无法创建保存目录 {}：{error}", output_dir.display()))?;
+        let task_cache_dir = download_task_cache_dir(&request.task_id)?;
+        fs::create_dir_all(&task_cache_dir)
+            .map_err(|error| format!("无法创建下载缓存目录 {}：{error}", task_cache_dir.display()))?;
+        let ytdlp_cache_dir = task_cache_dir.join("yt-dlp-cache");
+        fs::create_dir_all(&ytdlp_cache_dir)
+            .map_err(|error| format!("无法创建 yt-dlp 缓存目录 {}：{error}", ytdlp_cache_dir.display()))?;
 
         let mut command = Command::new(&yt_dlp_path);
         apply_tool_env_from_settings(&settings, &mut command);
@@ -779,8 +806,13 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
             .arg(&ffmpeg_path)
             .arg("--merge-output-format")
             .arg("mp4")
-            .arg("-P")
-            .arg(&request.output_dir)
+            .arg("--paths")
+            .arg(format!("home:{}", output_dir.display()))
+            .arg("--paths")
+            .arg(format!("temp:{}", task_cache_dir.display()))
+            .arg("--cache-dir")
+            .arg(&ytdlp_cache_dir)
+            .arg("--continue")
             .arg("-o")
             .arg("%(title).120B-%(id)s.%(ext)s")
             .arg("--print")
@@ -809,9 +841,13 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
 
         let child = Arc::new(Mutex::new(child));
         let canceled = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let task_id = request.task_id.clone();
 
         {
+            if let Ok(mut paused_tasks) = state.paused_tasks.lock() {
+                paused_tasks.remove(&task_id);
+            }
             let mut tasks = state
                 .tasks
                 .lock()
@@ -821,11 +857,12 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                 TaskControl {
                     child: Arc::clone(&child),
                     canceled: Arc::clone(&canceled),
+                    paused: Arc::clone(&paused),
                 },
             );
         }
 
-        upsert_history(
+        upsert_started_history(
             &state,
             HistoryItem {
                 id: task_id.clone(),
@@ -856,6 +893,7 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
         let progress_for_stderr = Arc::clone(&shared_progress);
         let expected_media = request.expected_media.clone();
         let ffmpeg_path_for_probe = ffmpeg_path.clone();
+        let cache_dir_for_finish = task_cache_dir.clone();
 
         thread::spawn(move || {
             let mut reader = BufReader::new(stderr);
@@ -973,9 +1011,17 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
 
             let exit_status = child.lock().ok().and_then(|mut child| child.wait().ok());
             let was_canceled = canceled.load(Ordering::SeqCst);
+            let was_paused = paused.load(Ordering::SeqCst);
             let success = exit_status.map(|status| status.success()).unwrap_or(false);
             let final_status = if was_canceled {
+                progress = 0.0;
                 "canceled"
+            } else if was_paused {
+                progress = shared_progress
+                    .lock()
+                    .map(|snapshot| snapshot.progress)
+                    .unwrap_or(progress);
+                "paused"
             } else if success {
                 progress = 100.0;
                 "completed"
@@ -999,6 +1045,9 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
             } else {
                 None
             };
+            if final_status == "completed" || final_status == "canceled" || final_status == "failed" {
+                let _ = remove_owned_download_cache_dir(&cache_dir_for_finish);
+            }
             let final_phase = if final_status == "completed" {
                 Some(DownloadPhase::Completed)
             } else {
@@ -1053,8 +1102,19 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
 
             {
                 if let Ok(mut tasks) = app_state.tasks.lock() {
-                    tasks.remove(&task_for_stdout);
+                    let should_remove = tasks
+                        .get(&task_for_stdout)
+                        .map(|control| Arc::ptr_eq(&control.child, &child))
+                        .unwrap_or(false);
+                    if should_remove {
+                        tasks.remove(&task_for_stdout);
+                    }
                 };
+                if final_status != "paused" {
+                    if let Ok(mut paused_tasks) = app_state.paused_tasks.lock() {
+                        paused_tasks.remove(&task_for_stdout);
+                    }
+                }
             }
         });
 
@@ -1075,19 +1135,19 @@ async fn cancel_download(app: AppHandle, task_id: String) -> Result<(), String> 
                 .map_err(|_| "下载任务状态锁已损坏。".to_string())?;
             tasks.remove(&task_id)
         };
-
-        let Some(control) = control else {
-            return Err("未找到正在运行的下载任务。".to_string());
-        };
-
-        control.canceled.store(true, Ordering::SeqCst);
-
-        if let Ok(mut child) = control.child.lock() {
-            child
-                .kill()
-                .map_err(|error| format!("取消下载失败：{error}"))?;
+        if let Ok(mut paused_tasks) = state.paused_tasks.lock() {
+            paused_tasks.remove(&task_id);
         }
 
+        if let Some(control) = control {
+            control.canceled.store(true, Ordering::SeqCst);
+
+            if let Ok(mut child) = control.child.lock() {
+                let _ = child.kill();
+            }
+        }
+
+        let _ = remove_owned_download_cache_dir(&download_task_cache_dir(&task_id)?);
         update_history_status(&state, &task_id, "canceled", 0.0, None, None, None, None)?;
 
         let _ = app.emit(
@@ -1115,6 +1175,79 @@ async fn cancel_download(app: AppHandle, task_id: String) -> Result<(), String> 
 }
 
 #[tauri::command]
+async fn pause_download(app: AppHandle, task_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let progress = history_progress_for_task(&state, &task_id).unwrap_or(0.0);
+        let control = {
+            let mut tasks = state
+                .tasks
+                .lock()
+                .map_err(|_| "下载任务状态锁已损坏。".to_string())?;
+            tasks.remove(&task_id)
+        };
+
+        let Some(control) = control else {
+            if let Ok(mut paused_tasks) = state.paused_tasks.lock() {
+                paused_tasks.insert(task_id.clone());
+            }
+            update_history_status(&state, &task_id, "paused", progress, None, None, None, None)?;
+            let _ = app.emit(
+                "download-progress",
+                ProgressEvent {
+                    task_id,
+                    status: "paused".to_string(),
+                    progress,
+                    phase: None,
+                    phase_label: None,
+                    speed: None,
+                    eta: None,
+                    line: None,
+                    output_path: None,
+                    local_media: None,
+                    media_comparison: None,
+                    error: None,
+                },
+            );
+            return Ok(());
+        };
+
+        control.paused.store(true, Ordering::SeqCst);
+        if let Ok(mut paused_tasks) = state.paused_tasks.lock() {
+            paused_tasks.insert(task_id.clone());
+        }
+
+        if let Ok(mut child) = control.child.lock() {
+            let _ = child.kill();
+        }
+
+        update_history_status(&state, &task_id, "paused", progress, None, None, None, None)?;
+
+        let _ = app.emit(
+            "download-progress",
+            ProgressEvent {
+                task_id,
+                status: "paused".to_string(),
+                progress,
+                phase: None,
+                phase_label: None,
+                speed: None,
+                eta: None,
+                line: None,
+                output_path: None,
+                local_media: None,
+                media_comparison: None,
+                error: None,
+            },
+        );
+
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("暂停下载任务失败：{error}"))?
+}
+
+#[tauri::command]
 async fn cancel_ytdlp_operation(app: AppHandle, operation_id: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -1139,6 +1272,36 @@ async fn cancel_ytdlp_operation(app: AppHandle, operation_id: String) -> Result<
     })
     .await
     .map_err(|error| format!("停止 yt-dlp 操作失败：{error}"))?
+}
+
+#[tauri::command]
+async fn scan_download_cleanup(app: AppHandle) -> Result<DownloadCleanupSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        build_download_cleanup_plan(&state).map(|plan| plan.summary)
+    })
+    .await
+    .map_err(|error| format!("扫描下载缓存失败：{error}"))?
+}
+
+#[tauri::command]
+async fn cleanup_download_cache(app: AppHandle) -> Result<DownloadCleanupSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let plan = build_download_cleanup_plan(&state)?;
+
+        for cache_dir in &plan.cache_dirs {
+            let _ = remove_owned_download_cache_dir(cache_dir);
+        }
+
+        if !plan.invalid_history_ids.is_empty() {
+            remove_history_items_by_ids(&state, &plan.invalid_history_ids)?;
+        }
+
+        Ok(plan.summary)
+    })
+    .await
+    .map_err(|error| format!("清理下载缓存失败：{error}"))?
 }
 
 #[tauri::command]
@@ -1346,7 +1509,10 @@ pub fn run() {
             parse_download_queue,
             start_download,
             cancel_download,
+            pause_download,
             cancel_ytdlp_operation,
+            scan_download_cleanup,
+            cleanup_download_cache,
             reveal_file,
             load_history,
             delete_history_item,
@@ -3447,7 +3613,7 @@ fn parse_progress_line(line: &str) -> Option<ParsedProgress> {
     let progress = before_percent[number_start..].parse::<f64>().ok()?;
 
     let speed =
-        extract_after(&line, " at ", " ETA ").and_then(|value| normalize_progress_value(&value));
+        extract_after(&line, " at ", " ETA ").and_then(|value| normalize_speed_value(&value));
     let eta = line.split(" ETA ").nth(1).and_then(normalize_eta_value);
 
     Some(ParsedProgress {
@@ -3461,7 +3627,7 @@ fn parse_progress_line(line: &str) -> Option<ParsedProgress> {
 fn parse_machine_progress_line(line: &str) -> Option<ParsedProgress> {
     let mut fields = line.split('|');
     let progress = fields.next().and_then(parse_percent_value)?;
-    let speed = fields.next().and_then(normalize_progress_value);
+    let speed = fields.next().and_then(normalize_speed_value);
     let eta = fields.next().and_then(normalize_eta_value);
     let vcodec = fields.next().and_then(normalize_progress_value);
     let acodec = fields.next().and_then(normalize_progress_value);
@@ -3511,6 +3677,59 @@ fn normalize_eta_value(value: &str) -> Option<String> {
     let value = value.trim();
     let value = value.split_whitespace().next().unwrap_or(value);
     normalize_progress_value(value)
+}
+
+fn normalize_speed_value(value: &str) -> Option<String> {
+    normalize_progress_value(value).map(|value| format_speed_value(&value))
+}
+
+fn format_speed_value(value: &str) -> String {
+    let normalized = value.trim();
+    let lower_value = normalized.to_ascii_lowercase();
+    let units = [
+        ("gib/s", 1024_f64 * 1024_f64 * 1024_f64),
+        ("mib/s", 1024_f64 * 1024_f64),
+        ("kib/s", 1024_f64),
+        ("gb/s", 1_000_000_000_f64),
+        ("mb/s", 1_000_000_f64),
+        ("kb/s", 1_000_f64),
+        ("b/s", 1_f64),
+    ];
+
+    for (unit, multiplier) in units {
+        if let Some(number) = lower_value.strip_suffix(unit) {
+            if let Ok(speed) = number.trim().parse::<f64>() {
+                return format_decimal_speed(speed * multiplier);
+            }
+        }
+    }
+
+    normalized.to_string()
+}
+
+fn format_decimal_speed(bytes_per_second: f64) -> String {
+    if !bytes_per_second.is_finite() || bytes_per_second <= 0.0 {
+        return "0B/s".to_string();
+    }
+
+    if bytes_per_second >= 1_000_000.0 {
+        return format_speed_number(bytes_per_second / 1_000_000.0, "MB/s");
+    }
+
+    if bytes_per_second >= 1_000.0 {
+        return format_speed_number(bytes_per_second / 1_000.0, "KB/s");
+    }
+
+    format!("{:.0}B/s", bytes_per_second.round())
+}
+
+fn format_speed_number(value: f64, unit: &str) -> String {
+    let text = if value >= 100.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+    };
+    format!("{}{}", text.trim_end_matches(".0"), unit)
 }
 
 fn normalize_progress_value(value: &str) -> Option<String> {
@@ -3573,7 +3792,7 @@ mod tests {
             parse_progress_line("VD_PROGRESS: 12.3%|8.4MiB/s|00:42|h264|none|137").unwrap();
 
         assert_eq!(parsed.progress, 12.3);
-        assert_eq!(parsed.speed.as_deref(), Some("8.4MiB/s"));
+        assert_eq!(parsed.speed.as_deref(), Some("8.8MB/s"));
         assert_eq!(parsed.eta.as_deref(), Some("00:42"));
         assert_eq!(parsed.media_kind, ProgressMediaKind::Video);
 
@@ -3594,7 +3813,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(parsed.progress, 35.2);
-        assert_eq!(parsed.speed.as_deref(), Some("3.1MiB/s"));
+        assert_eq!(parsed.speed.as_deref(), Some("3.3MB/s"));
         assert_eq!(parsed.eta.as_deref(), Some("00:25"));
         assert_eq!(parsed.media_kind, ProgressMediaKind::Unknown);
     }
@@ -3605,7 +3824,7 @@ mod tests {
             parse_progress_line("[download] 100% of 120.00MiB in 00:30 at 4.0MiB/s").unwrap();
 
         assert_eq!(parsed.progress, 100.0);
-        assert_eq!(parsed.speed.as_deref(), Some("4.0MiB/s"));
+        assert_eq!(parsed.speed.as_deref(), Some("4.2MB/s"));
         assert_eq!(parsed.eta, None);
     }
 
@@ -4054,6 +4273,184 @@ fn tool_settings_path() -> Result<PathBuf, String> {
     Ok(app_data_dir()?.join("tool-settings.json"))
 }
 
+fn download_cache_root() -> Result<PathBuf, String> {
+    Ok(app_data_dir()?.join(DOWNLOAD_CACHE_DIR_NAME))
+}
+
+fn download_task_cache_dir(task_id: &str) -> Result<PathBuf, String> {
+    Ok(download_cache_root()?.join(sanitize_cache_component(task_id)))
+}
+
+fn sanitize_cache_component(value: &str) -> String {
+    let text: String = value
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || *character == '-' || *character == '_'
+        })
+        .collect();
+
+    if text.is_empty() {
+        "unknown-task".to_string()
+    } else {
+        text
+    }
+}
+
+fn remove_owned_download_cache_dir(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let root = download_cache_root()?;
+    ensure_owned_cache_child(&root, path)?;
+    fs::remove_dir_all(path)
+        .map_err(|error| format!("删除下载缓存失败 {}：{error}", path.display()))
+}
+
+fn ensure_owned_cache_child(root: &Path, path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("读取缓存路径失败 {}：{error}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("跳过符号链接缓存路径：{}", path.display()));
+    }
+
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("定位缓存根目录失败 {}：{error}", root.display()))?;
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("定位缓存路径失败 {}：{error}", path.display()))?;
+
+    if path == root || !path.starts_with(&root) {
+        return Err(format!("拒绝清理非应用缓存路径：{}", path.display()));
+    }
+
+    Ok(())
+}
+
+fn build_download_cleanup_plan(state: &AppState) -> Result<DownloadCleanupPlan, String> {
+    let active_ids = active_download_task_ids(state)?;
+    let mut plan = DownloadCleanupPlan::default();
+    let root = download_cache_root()?;
+
+    if root.exists() {
+        let entries = fs::read_dir(&root)
+            .map_err(|error| format!("读取下载缓存目录失败 {}：{error}", root.display()))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("读取下载缓存条目失败：{error}"))?;
+            let path = entry.path();
+            let task_id = entry.file_name().to_string_lossy().to_string();
+
+            if active_ids.contains(&task_id) {
+                plan.summary.skipped_active_tasks += 1;
+                continue;
+            }
+
+            if ensure_owned_cache_child(&root, &path).is_err() {
+                continue;
+            }
+
+            let stats = path_stats(&path)?;
+            plan.summary.file_count += stats.file_count;
+            plan.summary.directory_count += stats.directory_count.max(1);
+            plan.summary.bytes += stats.bytes;
+            plan.cache_dirs.push(path);
+        }
+    }
+
+    let history = read_history(state)?;
+    for item in &history {
+        if is_invalid_history_item(item, &active_ids) {
+            plan.invalid_history_ids.insert(item.id.clone());
+        }
+    }
+    plan.summary.invalid_history_count = plan.invalid_history_ids.len() as u64;
+
+    Ok(plan)
+}
+
+fn active_download_task_ids(state: &AppState) -> Result<HashSet<String>, String> {
+    let tasks = state
+        .tasks
+        .lock()
+        .map_err(|_| "下载任务状态锁已损坏。".to_string())?;
+    let mut ids: HashSet<String> = tasks.keys().cloned().collect();
+    drop(tasks);
+
+    let paused_tasks = state
+        .paused_tasks
+        .lock()
+        .map_err(|_| "暂停任务状态锁已损坏。".to_string())?;
+    ids.extend(paused_tasks.iter().cloned());
+
+    Ok(ids)
+}
+
+#[derive(Default)]
+struct PathStats {
+    file_count: u64,
+    directory_count: u64,
+    bytes: u64,
+}
+
+fn path_stats(path: &Path) -> Result<PathStats, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("读取缓存路径失败 {}：{error}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Ok(PathStats::default());
+    }
+    if metadata.is_file() {
+        return Ok(PathStats {
+            file_count: 1,
+            directory_count: 0,
+            bytes: metadata.len(),
+        });
+    }
+    if !metadata.is_dir() {
+        return Ok(PathStats::default());
+    }
+
+    let mut stats = PathStats {
+        directory_count: 1,
+        ..Default::default()
+    };
+    let entries = fs::read_dir(path)
+        .map_err(|error| format!("读取缓存目录失败 {}：{error}", path.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("读取缓存条目失败：{error}"))?;
+        let child_stats = path_stats(&entry.path())?;
+        stats.file_count += child_stats.file_count;
+        stats.directory_count += child_stats.directory_count;
+        stats.bytes += child_stats.bytes;
+    }
+
+    Ok(stats)
+}
+
+fn is_invalid_history_item(item: &HistoryItem, active_ids: &HashSet<String>) -> bool {
+    if active_ids.contains(&item.id) {
+        return false;
+    }
+
+    match item.status.as_str() {
+        "failed" | "canceled" => true,
+        "running" | "paused" => history_is_stale(item),
+        "completed" => item
+            .output_path
+            .as_deref()
+            .map(|path| !Path::new(path).is_file())
+            .unwrap_or(true),
+        _ => false,
+    }
+}
+
+fn history_is_stale(item: &HistoryItem) -> bool {
+    let updated_at = item.updated_at.parse::<u64>().unwrap_or_default();
+    let now = unix_timestamp().parse::<u64>().unwrap_or_default();
+    now.saturating_sub(updated_at) >= STALE_ACTIVE_HISTORY_SECONDS
+}
+
 fn read_tool_settings(state: &AppState) -> Result<ToolSettings, String> {
     let _guard = state
         .tool_settings_lock
@@ -4285,7 +4682,17 @@ fn delete_history_item_by_id(state: &AppState, id: &str, delete_file: bool) -> R
     write_history_unlocked(&items)
 }
 
-fn upsert_history(state: &AppState, item: HistoryItem) -> Result<(), String> {
+fn remove_history_items_by_ids(state: &AppState, ids: &HashSet<String>) -> Result<(), String> {
+    let _guard = state
+        .history_lock
+        .lock()
+        .map_err(|_| "历史记录锁已损坏。".to_string())?;
+    let mut items = read_history_unlocked()?;
+    items.retain(|item| !ids.contains(&item.id));
+    write_history_unlocked(&items)
+}
+
+fn upsert_started_history(state: &AppState, item: HistoryItem) -> Result<(), String> {
     let _guard = state
         .history_lock
         .lock()
@@ -4293,12 +4700,36 @@ fn upsert_history(state: &AppState, item: HistoryItem) -> Result<(), String> {
     let mut items = read_history_unlocked()?;
 
     if let Some(existing) = items.iter_mut().find(|existing| existing.id == item.id) {
-        *existing = item;
+        let preserved_progress = if existing.status == "paused" {
+            existing.progress
+        } else {
+            item.progress
+        };
+        existing.url = item.url;
+        existing.title = item.title;
+        existing.site = item.site;
+        existing.format = item.format;
+        existing.browser = item.browser;
+        existing.output_dir = item.output_dir;
+        existing.status = "running".to_string();
+        existing.progress = preserved_progress;
+        existing.output_path = None;
+        existing.local_media = None;
+        existing.media_comparison = None;
+        existing.error = None;
+        existing.updated_at = unix_timestamp();
     } else {
         items.insert(0, item);
     }
 
     write_history_unlocked(&items)
+}
+
+fn history_progress_for_task(state: &AppState, task_id: &str) -> Option<f64> {
+    read_history(state)
+        .ok()
+        .and_then(|items| items.into_iter().find(|item| item.id == task_id))
+        .map(|item| item.progress)
 }
 
 fn update_history_status(

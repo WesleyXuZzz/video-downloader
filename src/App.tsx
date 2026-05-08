@@ -58,6 +58,7 @@ import {
   cancelYtdlpOperation,
   checkDependencies,
   checkToolUpdates,
+  cleanupDownloadCache,
   clearFfmpegCommandHistory,
   clearToolPath,
   deleteFfmpegCommandHistoryItems,
@@ -68,9 +69,11 @@ import {
   loadToolSettings,
   loadSupportedSites,
   parseDownloadQueue,
+  pauseDownload,
   prefillTerminalCommand,
   probeUrl,
   revealFile,
+  scanDownloadCleanup,
   selectDirectory,
   selectMediaFile,
   selectToolExecutable,
@@ -83,6 +86,7 @@ import type {
   BatchParseItem,
   BrowserKind,
   DependencyStatus,
+  DownloadCleanupSummary,
   DownloadHistoryItem,
   DownloadPhase,
   DownloadQueueStatus,
@@ -312,6 +316,11 @@ export default function App() {
   const [historyDeleteTarget, setHistoryDeleteTarget] =
     useState<DownloadHistoryItem | null>(null);
   const [historyDeleteBusy, setHistoryDeleteBusy] = useState(false);
+  const [cleanupSummary, setCleanupSummary] =
+    useState<DownloadCleanupSummary | null>(null);
+  const [isCleanupModalOpen, setIsCleanupModalOpen] = useState(false);
+  const [isScanningCleanup, setIsScanningCleanup] = useState(false);
+  const [isCleaningCache, setIsCleaningCache] = useState(false);
   const [supportedSites, setSupportedSites] =
     useState<SupportedSitesResponse | null>(null);
   const [isProbing, setIsProbing] = useState(false);
@@ -354,6 +363,7 @@ export default function App() {
     Record<string, ThumbnailLoadState>
   >({});
   const activeTaskRef = useRef<Set<string>>(new Set());
+  const queueItemIdsRef = useRef<Set<string>>(new Set());
   const startingTaskRef = useRef<Set<string>>(new Set());
   const metadataProbeRef = useRef<Set<string>>(new Set());
   const schedulingRef = useRef(false);
@@ -387,7 +397,11 @@ export default function App() {
   const hasRunningQueue = queueSummary.running > 0;
   const hasIdleQueue = queueSummary.idle > 0;
   const hasQueuedQueue = queueSummary.queued > 0;
-  const hasCancelableQueue = hasRunningQueue || hasQueuedQueue;
+  const hasPausedQueue = queueSummary.paused > 0;
+  const hasPausableQueue = hasRunningQueue || hasQueuedQueue;
+  const hasResumableQueue = hasPausedQueue && !hasPausableQueue;
+  const hasCancelableQueue =
+    hasRunningQueue || hasQueuedQueue || hasPausedQueue || hasIdleQueue;
   const hasQueueItems = queue.length > 0;
   const hasQueueAuthProbeTargets = queue.some(queueItemCanAuthProbe);
   const isQueueAuthChecking = Boolean(queueAuthSummary?.checking);
@@ -395,6 +409,7 @@ export default function App() {
     return (
       queue.find((item) => item.status === "running") ??
       queue.find((item) => item.status === "queued") ??
+      queue.find((item) => item.status === "paused") ??
       queue.find((item) => item.status === "idle") ??
       queue.find((item) => item.status === "completed") ??
       queue.find((item) => item.status === "failed" && !item.parseError) ??
@@ -429,6 +444,7 @@ export default function App() {
     (hasQueueItems ? queue.length : urlLineCount) > 1
       ? "开始批量下载"
       : "开始下载";
+  const pauseActionLabel = hasResumableQueue ? "继续下载" : "暂停队列";
 
   useEffect(() => {
     refreshStartupData();
@@ -457,6 +473,7 @@ export default function App() {
     activeTaskRef.current = new Set(
       queue.filter((item) => item.status === "running").map((item) => item.id),
     );
+    queueItemIdsRef.current = new Set(queue.map((item) => item.id));
   }, [queue]);
 
   useEffect(() => {
@@ -1018,26 +1035,57 @@ export default function App() {
     message.info("已停止解析");
   }
 
-  function handleClearQueue() {
-    if (hasRunningQueue) {
-      void cancelAllQueueItems();
+  async function handleOpenCleanupModal() {
+    if (isScanningCleanup || isCleaningCache) {
       return;
     }
 
-    queueAuthProbeBatchRef.current += 1;
-    authProbeRequestRef.current += 1;
-    cancelAuthOperations();
-    setQueue([]);
-    setStatus("idle");
-    setProgress(0);
-    setSpeed(null);
-    setEta(null);
-    setOutputPath(null);
+    setIsScanningCleanup(true);
     setError(null);
-    setFailedThumbnail(null);
-    setThumbnailLoadStates({});
-    startingTaskRef.current.clear();
-    metadataProbeRef.current.clear();
+
+    try {
+      const summary = await scanDownloadCleanup();
+      setCleanupSummary(summary);
+      setIsCleanupModalOpen(true);
+    } catch (caught) {
+      const nextError = readError(caught);
+      setError(nextError);
+      message.error(nextError);
+    } finally {
+      setIsScanningCleanup(false);
+    }
+  }
+
+  function closeCleanupModal() {
+    if (!isCleaningCache) {
+      setIsCleanupModalOpen(false);
+    }
+  }
+
+  async function handleCleanupCache() {
+    if (isCleaningCache) {
+      return;
+    }
+
+    setIsCleaningCache(true);
+    setError(null);
+
+    try {
+      const summary = await cleanupDownloadCache();
+      setCleanupSummary(summary);
+      setIsCleanupModalOpen(false);
+      await refreshHistory();
+      setQueue((items) =>
+        items.filter((item) => !isInvalidQueueAfterCleanup(item)),
+      );
+      message.success(`清理完成，预计释放 ${formatBytes(summary.bytes)}`);
+    } catch (caught) {
+      const nextError = readError(caught);
+      setError(nextError);
+      message.error(nextError);
+    } finally {
+      setIsCleaningCache(false);
+    }
   }
 
   function handleStartQueue() {
@@ -1058,19 +1106,122 @@ export default function App() {
     );
   }
 
-  function handleToggleQueuePause() {
-    setIsQueuePaused((paused) => !paused);
+  async function handleToggleQueuePause() {
+    if (hasResumableQueue) {
+      setQueue((items) =>
+        items.map((item) =>
+          item.status === "paused"
+            ? {
+                ...item,
+                status: "queued",
+                speed: null,
+                eta: null,
+                error: null,
+              }
+            : item,
+        ),
+      );
+      setIsQueuePaused(false);
+      return;
+    }
+
+    if (!hasPausableQueue) {
+      return;
+    }
+
+    setIsQueuePaused(true);
+    const runningIds = queue
+      .filter((item) => item.status === "running")
+      .map((item) => item.id);
+    runningIds.forEach((taskId) => startingTaskRef.current.delete(taskId));
+    setQueue((items) =>
+      items.map((item) =>
+        item.status === "queued"
+          ? {
+              ...item,
+              status: "paused",
+              speed: null,
+              eta: null,
+            }
+          : item,
+      ),
+    );
+
+    const results = await Promise.allSettled(
+      runningIds.map((taskId) => pauseDownload(taskId)),
+    );
+    const rejected = results.find((result) => result.status === "rejected");
+    if (rejected?.status === "rejected") {
+      const nextError = readError(rejected.reason);
+      setError(nextError);
+      message.error(nextError);
+    }
   }
 
   async function handleCancelQueueItem(item: QueueItem) {
-    if (item.status === "running") {
+    if (
+      item.status === "running" ||
+      item.status === "queued" ||
+      item.status === "paused" ||
+      item.status === "idle"
+    ) {
       try {
         await cancelDownload(item.id);
+        startingTaskRef.current.delete(item.id);
+        setQueue((items) =>
+          items.map((candidate) =>
+            candidate.id === item.id
+              ? {
+                  ...candidate,
+                  status: "canceled",
+                  progress: 0,
+                  phase: null,
+                  phaseLabel: null,
+                  speed: null,
+                  eta: null,
+                  error: null,
+                }
+              : candidate,
+          ),
+        );
       } catch (caught) {
         const nextError = readError(caught);
         setError(nextError);
         message.error(nextError);
       }
+      return;
+    }
+  }
+
+  async function handlePauseQueueItem(item: QueueItem) {
+    if (item.status === "queued") {
+      startingTaskRef.current.delete(item.id);
+      setQueue((items) =>
+        items.map((candidate) =>
+          candidate.id === item.id
+            ? { ...candidate, status: "paused", speed: null, eta: null }
+            : candidate,
+        ),
+      );
+      return;
+    }
+
+    if (item.status !== "running") {
+      return;
+    }
+
+    try {
+      startingTaskRef.current.delete(item.id);
+      await pauseDownload(item.id);
+    } catch (caught) {
+      const nextError = readError(caught);
+      setError(nextError);
+      message.error(nextError);
+    }
+  }
+
+  function handleResumeQueueItem(item: QueueItem) {
+    if (item.status !== "paused") {
       return;
     }
 
@@ -1079,14 +1230,15 @@ export default function App() {
         candidate.id === item.id
           ? {
               ...candidate,
-              status: "canceled",
-              progress: 0,
-              phase: null,
-              phaseLabel: null,
+              status: "queued",
+              speed: null,
+              eta: null,
+              error: null,
             }
           : candidate,
       ),
     );
+    setIsQueuePaused(false);
   }
 
   function handleRetryQueueItem(item: QueueItem) {
@@ -1195,28 +1347,32 @@ export default function App() {
   }
 
   async function cancelAllQueueItems() {
-    const runningIds = queue
-      .filter((item) => item.status === "running")
+    const cancelableIds = queue
+      .filter((item) =>
+        ["running", "queued", "paused", "idle"].includes(item.status),
+      )
       .map((item) => item.id);
 
     setIsQueuePaused(true);
-    runningIds.forEach((taskId) => startingTaskRef.current.delete(taskId));
+    cancelableIds.forEach((taskId) => startingTaskRef.current.delete(taskId));
     setQueue((items) =>
       items.map((item) =>
-        item.status === "queued" || item.status === "idle"
+        ["running", "queued", "paused", "idle"].includes(item.status)
           ? {
               ...item,
               status: "canceled",
               progress: 0,
               phase: null,
               phaseLabel: null,
+              speed: null,
+              eta: null,
             }
           : item,
       ),
     );
 
     const results = await Promise.allSettled(
-      runningIds.map((taskId) => cancelDownload(taskId)),
+      cancelableIds.map((taskId) => cancelDownload(taskId)),
     );
     const rejected = results.find((result) => result.status === "rejected");
     if (rejected?.status === "rejected") {
@@ -1259,6 +1415,7 @@ export default function App() {
 
   async function startQueueItem(item: QueueItem) {
     let downloadItem = item;
+    const shouldResumeProgress = item.progress > 0 && item.status === "queued";
 
     if (queueItemHasPlaceholderTitle(item)) {
       try {
@@ -1282,9 +1439,9 @@ export default function App() {
               ...candidate,
               status: "running",
               parseError: false,
-              progress: 0,
-              phase: null,
-              phaseLabel: null,
+              progress: shouldResumeProgress ? candidate.progress : 0,
+              phase: shouldResumeProgress ? candidate.phase : null,
+              phaseLabel: shouldResumeProgress ? candidate.phaseLabel : null,
               speed: null,
               eta: null,
               localMedia: null,
@@ -1632,7 +1789,10 @@ export default function App() {
   }
 
   function handleProgress(event: ProgressEvent) {
-    if (!activeTaskRef.current.has(event.taskId)) {
+    if (
+      !activeTaskRef.current.has(event.taskId) &&
+      !queueItemIdsRef.current.has(event.taskId)
+    ) {
       return;
     }
 
@@ -1664,10 +1824,12 @@ export default function App() {
     setOutputPath(event.outputPath ?? null);
     setError(event.error ?? null);
 
-    if (["completed", "failed", "canceled"].includes(event.status)) {
+    if (["completed", "failed", "canceled", "paused"].includes(event.status)) {
       startingTaskRef.current.delete(event.taskId);
       refreshHistory();
-      window.setTimeout(scheduleQueuedDownloads, 0);
+      if (event.status !== "paused") {
+        window.setTimeout(scheduleQueuedDownloads, 0);
+      }
     }
   }
 
@@ -1754,6 +1916,11 @@ export default function App() {
     ? historyTitle(historyDeleteTarget)
     : "";
   const historyDeleteOutputPath = historyDeleteTarget?.outputPath?.trim() ?? "";
+  const cleanupHasItems = cleanupSummary
+    ? cleanupSummary.fileCount > 0 ||
+      cleanupSummary.directoryCount > 0 ||
+      cleanupSummary.invalidHistoryCount > 0
+    : false;
 
   return (
     <Layout className="app-shell" onContextMenu={handleAppContextMenu}>
@@ -1884,7 +2051,7 @@ export default function App() {
                     />
                   </div>
                   <Button
-                    className="url-probe-button"
+                    className={`url-probe-button ${isParsingQueue ? "is-stop" : ""}`}
                     danger={isParsingQueue}
                     disabled={!isParsingQueue && !url.trim()}
                     icon={isParsingQueue ? <StopOutlined /> : <SearchOutlined />}
@@ -2000,11 +2167,11 @@ export default function App() {
                 </Button>
                 <Button
                   className="queue-command-button is-pause"
-                  disabled={!hasQueuedQueue}
-                  icon={<PauseCircleOutlined />}
+                  disabled={!hasPausableQueue && !hasResumableQueue}
+                  icon={hasResumableQueue ? <PlayCircleOutlined /> : <PauseCircleOutlined />}
                   onClick={handleToggleQueuePause}
                 >
-                  {isQueuePaused ? "恢复队列" : "暂停队列"}
+                  {pauseActionLabel}
                 </Button>
                 <Button
                   className="queue-command-button is-cancel"
@@ -2017,11 +2184,11 @@ export default function App() {
                 </Button>
                 <Button
                   className="queue-command-button is-clear"
-                  disabled={!hasQueueItems && !url.trim()}
-                  icon={<StopOutlined />}
-                  onClick={handleClearQueue}
+                  icon={<DeleteOutlined />}
+                  loading={isScanningCleanup}
+                  onClick={handleOpenCleanupModal}
                 >
-                  清空
+                  清理缓存
                 </Button>
               </Space>
             </Space>
@@ -2258,6 +2425,28 @@ export default function App() {
                           </Tooltip>
                         ) : null}
                         {item.status === "running" || item.status === "queued" ? (
+                          <Tooltip title="暂停">
+                            <Button
+                              aria-label={`暂停 ${item.title}`}
+                              className="history-action-button queue-pause-button"
+                              icon={<PauseCircleOutlined />}
+                              onClick={() => {
+                                void handlePauseQueueItem(item);
+                              }}
+                            />
+                          </Tooltip>
+                        ) : null}
+                        {item.status === "paused" ? (
+                          <Tooltip title="继续">
+                            <Button
+                              aria-label={`继续 ${item.title}`}
+                              className="history-action-button"
+                              icon={<PlayCircleOutlined />}
+                              onClick={() => handleResumeQueueItem(item)}
+                            />
+                          </Tooltip>
+                        ) : null}
+                        {["running", "queued", "paused"].includes(item.status) ? (
                           <Tooltip title="取消">
                             <Button
                               aria-label={`取消 ${item.title}`}
@@ -2267,7 +2456,7 @@ export default function App() {
                             />
                           </Tooltip>
                         ) : null}
-                        {item.status !== "running" ? (
+                        {!["running", "queued", "paused"].includes(item.status) ? (
                           <Popconfirm
                             cancelText="取消"
                             description="任务会从队列中移除，已下载文件不会被删除。"
@@ -2302,6 +2491,7 @@ export default function App() {
               <div className="status-count-grid">
                 <StatusCount label="已完成" value={queueSummary.completed} tone="success" />
                 <StatusCount label="下载中" value={queueSummary.running} tone="processing" />
+                <StatusCount label="已暂停" value={queueSummary.paused} tone="waiting" />
                 <StatusCount label="等待中" value={queueSummary.queued} tone="waiting" />
                 <StatusCount label="失败" value={queueSummary.failed} tone="danger" />
                 <StatusCount label="已解析" value={queueSummary.idle} tone="neutral" />
@@ -2421,6 +2611,19 @@ export default function App() {
           />
         ) : null}
       </Modal>
+      <Modal
+        centered
+        destroyOnClose
+        okButtonProps={{ disabled: !cleanupHasItems, danger: true }}
+        okText="确认清理"
+        onCancel={closeCleanupModal}
+        onOk={handleCleanupCache}
+        open={isCleanupModalOpen}
+        confirmLoading={isCleaningCache}
+        title="清理下载缓存？"
+      >
+        <CleanupConfirmContent summary={cleanupSummary} />
+      </Modal>
     </Layout>
   );
 }
@@ -2518,6 +2721,54 @@ function DeleteHistoryConfirmContent({
       {outputPath ? (
         <Text type="secondary">本地文件：{outputPath}</Text>
       ) : null}
+    </div>
+  );
+}
+
+function CleanupConfirmContent({
+  summary,
+}: {
+  summary: DownloadCleanupSummary | null;
+}) {
+  if (!summary) {
+    return <Text type="secondary">正在扫描可清理内容...</Text>;
+  }
+
+  const hasItems =
+    summary.fileCount > 0 ||
+    summary.directoryCount > 0 ||
+    summary.invalidHistoryCount > 0;
+
+  return (
+    <div className="cleanup-confirm">
+      <Text>
+        {hasItems
+          ? "将清理应用确认归属的未完成缓存，并移除无效历史记录。"
+          : "没有发现需要清理的下载缓存或无效历史记录。"}
+      </Text>
+      <div className="cleanup-summary-grid">
+        <CleanupMetric label="预计释放" value={formatBytes(summary.bytes)} />
+        <CleanupMetric label="缓存文件" value={`${summary.fileCount} 个`} />
+        <CleanupMetric label="缓存目录" value={`${summary.directoryCount} 个`} />
+        <CleanupMetric
+          label="无效历史"
+          value={`${summary.invalidHistoryCount} 条`}
+        />
+      </div>
+      {summary.skippedActiveTasks > 0 ? (
+        <Text type="secondary">
+          已跳过 {summary.skippedActiveTasks} 个正在运行或可继续的任务缓存。
+        </Text>
+      ) : null}
+    </div>
+  );
+}
+
+function CleanupMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="cleanup-metric">
+      <Text type="secondary">{label}</Text>
+      <Text strong>{value}</Text>
     </div>
   );
 }
@@ -3484,6 +3735,10 @@ function progressStatus(status: DownloadStatus): ProgressProps["status"] {
     return "active";
   }
 
+  if (status === "paused") {
+    return "normal";
+  }
+
   return "normal";
 }
 
@@ -3498,6 +3753,10 @@ function queueProgressStatus(status: DownloadQueueStatus): ProgressProps["status
 
   if (status === "running") {
     return "active";
+  }
+
+  if (status === "paused") {
+    return "normal";
   }
 
   return "normal";
@@ -3584,6 +3843,8 @@ function summarizeQueue(items: QueueItem[]) {
         summary.completed += 1;
       } else if (item.status === "running") {
         summary.running += 1;
+      } else if (item.status === "paused") {
+        summary.paused += 1;
       } else if (item.status === "queued") {
         summary.queued += 1;
       } else if (item.status === "idle") {
@@ -3596,7 +3857,15 @@ function summarizeQueue(items: QueueItem[]) {
 
       return summary;
     },
-    { completed: 0, running: 0, queued: 0, idle: 0, failed: 0, canceled: 0 },
+    {
+      completed: 0,
+      running: 0,
+      paused: 0,
+      queued: 0,
+      idle: 0,
+      failed: 0,
+      canceled: 0,
+    },
   );
 }
 
@@ -3984,6 +4253,10 @@ function positiveInteger(value?: number | null) {
 }
 
 function queueRuntimeMeta(item: QueueItem) {
+  if (item.status === "paused") {
+    return "已暂停，可继续下载";
+  }
+
   if (item.status !== "running") {
     return null;
   }
@@ -3995,6 +4268,34 @@ function queueRuntimeMeta(item: QueueItem) {
   ].filter(Boolean);
 
   return parts.length ? parts.join(" · ") : null;
+}
+
+function isInvalidQueueAfterCleanup(item: QueueItem) {
+  return item.status === "failed" || item.status === "canceled";
+}
+
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0B";
+  }
+
+  if (bytes >= 1_000_000_000) {
+    return `${trimNumber(bytes / 1_000_000_000)}GB`;
+  }
+
+  if (bytes >= 1_000_000) {
+    return `${trimNumber(bytes / 1_000_000)}MB`;
+  }
+
+  if (bytes >= 1_000) {
+    return `${trimNumber(bytes / 1_000)}KB`;
+  }
+
+  return `${Math.round(bytes)}B`;
+}
+
+function trimNumber(value: number) {
+  return (value >= 100 ? value.toFixed(0) : value.toFixed(1)).replace(/\.0$/, "");
 }
 
 function titleFromUrl(url: string) {

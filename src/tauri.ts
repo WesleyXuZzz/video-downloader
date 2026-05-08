@@ -5,6 +5,7 @@ import type {
   BrowserKind,
   BatchParseItem,
   DependencyStatus,
+  DownloadCleanupSummary,
   DownloadHistoryItem,
   DownloadRequest,
   FfmpegCommandDraft,
@@ -27,6 +28,7 @@ type ProgressHandler = (event: ProgressEvent) => void;
 
 const mockListeners = new Set<ProgressHandler>();
 const mockTimers = new Map<string, number>();
+const mockProgress = new Map<string, number>();
 const mockToolSettings: ToolSettings = {
   ytDlpPath: null,
   ffmpegPath: null,
@@ -302,6 +304,7 @@ export async function cancelDownload(taskId: string): Promise<void> {
       window.clearInterval(timer);
       mockTimers.delete(taskId);
     }
+    mockProgress.delete(taskId);
     emitMock({
       taskId,
       status: "canceled",
@@ -311,6 +314,46 @@ export async function cancelDownload(taskId: string): Promise<void> {
   }
 
   return invoke<void>("cancel_download", { taskId });
+}
+
+export async function pauseDownload(taskId: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    const timer = mockTimers.get(taskId);
+    if (timer) {
+      window.clearInterval(timer);
+      mockTimers.delete(taskId);
+    }
+    emitMock({
+      taskId,
+      status: "paused",
+      progress: mockProgress.get(taskId) ?? 0,
+    });
+    return;
+  }
+
+  return invoke<void>("pause_download", { taskId });
+}
+
+export async function scanDownloadCleanup(): Promise<DownloadCleanupSummary> {
+  if (!isTauriRuntime()) {
+    return {
+      fileCount: 0,
+      directoryCount: 0,
+      bytes: 0,
+      invalidHistoryCount: 0,
+      skippedActiveTasks: mockTimers.size,
+    };
+  }
+
+  return invoke<DownloadCleanupSummary>("scan_download_cleanup");
+}
+
+export async function cleanupDownloadCache(): Promise<DownloadCleanupSummary> {
+  if (!isTauriRuntime()) {
+    return scanDownloadCleanup();
+  }
+
+  return invoke<DownloadCleanupSummary>("cleanup_download_cache");
 }
 
 export async function revealFile(path: string): Promise<void> {
@@ -522,9 +565,10 @@ export async function subscribeDownloadProgress(
 }
 
 function runMockDownload(taskId: string) {
-  let progress = 0;
+  let progress = mockProgress.get(taskId) ?? 0;
   const timer = window.setInterval(() => {
     progress = Math.min(100, progress + 7 + Math.random() * 9);
+    mockProgress.set(taskId, progress);
     const phase =
       progress >= 100
         ? "completed"
@@ -547,7 +591,7 @@ function runMockDownload(taskId: string) {
       progress,
       phase,
       phaseLabel,
-      speed: progress >= 100 ? null : "8.4MiB/s",
+      speed: progress >= 100 ? null : "8.4MB/s",
       eta: progress >= 100 ? null : "00:12",
       outputPath:
         progress >= 100
@@ -571,6 +615,7 @@ function runMockDownload(taskId: string) {
     if (progress >= 100) {
       window.clearInterval(timer);
       mockTimers.delete(taskId);
+      mockProgress.delete(taskId);
     }
   }, 580);
 

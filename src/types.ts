@@ -20,6 +20,7 @@ export type ProxySource =
 export type DownloadStatus =
   | "idle"
   | "running"
+  | "paused"
   | "completed"
   | "failed"
   | "canceled";
@@ -172,6 +173,14 @@ export interface ProgressEvent {
   localMedia?: LocalMediaInfo | null;
   mediaComparison?: MediaComparison | null;
   error?: string | null;
+}
+
+export interface DownloadCleanupSummary {
+  fileCount: number;
+  directoryCount: number;
+  bytes: number;
+  invalidHistoryCount: number;
+  skippedActiveTasks: number;
 }
 
 export interface LocalMediaInfo {

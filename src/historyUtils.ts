@@ -3,6 +3,7 @@ import type { DownloadHistoryItem, DownloadStatus } from "./types";
 export const statusCopy: Record<DownloadStatus, string> = {
   idle: "待开始",
   running: "下载中",
+  paused: "已暂停",
   completed: "已完成",
   failed: "失败",
   canceled: "已取消",
@@ -11,6 +12,10 @@ export const statusCopy: Record<DownloadStatus, string> = {
 export function statusTagColor(status: DownloadStatus) {
   if (status === "running") {
     return "processing";
+  }
+
+  if (status === "paused") {
+    return "warning";
   }
 
   if (status === "completed") {
