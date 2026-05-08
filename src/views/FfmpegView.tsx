@@ -6,6 +6,7 @@ import {
   Empty,
   Input,
   List,
+  Modal,
   Pagination,
   Select,
   Space,
@@ -31,6 +32,11 @@ import {
 } from "@ant-design/icons";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import PanelTitle from "../components/PanelTitle";
+import {
+  FFMPEG_PRESET_LABELS,
+  ffmpegPresetLabel,
+  isKnownFfmpegPresetId,
+} from "../ffmpegPresets";
 import { formatHistoryDate } from "../historyUtils";
 import type {
   FfmpegCommandDraft,
@@ -65,7 +71,7 @@ type FfmpegViewProps = {
   onChooseInputFile: () => void;
   onChooseOutputDirectory: () => void;
   onChooseSecondaryFile: () => void;
-  onClearHistory: () => void;
+  onClearHistory: () => void | Promise<void>;
   onCopyCommand: () => void;
   onCopyHistoryCommand: (command: string) => void;
   onCrfChange: (value: number) => void;
@@ -126,24 +132,16 @@ const crfOptions = [
 
 const pageSizeOptions = [20, 50, 200];
 
-const presetCopy: Record<FfmpegPresetId, string> = {
-  convertMp4: "转 MP4",
-  compress: "压缩视频",
-  extractAudio: "提取音频",
-  trim: "截取片段",
-  mergeAudioVideo: "合并音视频",
-};
-
 const ffmpegHistoryPresetFilterOptions: Array<{
   label: string;
   value: PresetFilter;
 }> = [
   { label: "全部", value: "all" },
-  { label: presetCopy.convertMp4, value: "convertMp4" },
-  { label: presetCopy.compress, value: "compress" },
-  { label: presetCopy.extractAudio, value: "extractAudio" },
-  { label: presetCopy.trim, value: "trim" },
-  { label: presetCopy.mergeAudioVideo, value: "mergeAudioVideo" },
+  { label: FFMPEG_PRESET_LABELS.convertMp4, value: "convertMp4" },
+  { label: FFMPEG_PRESET_LABELS.compress, value: "compress" },
+  { label: FFMPEG_PRESET_LABELS.extractAudio, value: "extractAudio" },
+  { label: FFMPEG_PRESET_LABELS.trim, value: "trim" },
+  { label: FFMPEG_PRESET_LABELS.mergeAudioVideo, value: "mergeAudioVideo" },
 ];
 
 export default function FfmpegView({
@@ -401,15 +399,18 @@ function FfmpegCommandHistoryCard({
   history: FfmpegCommandHistoryItem[];
   isLoading: boolean;
   isMutating: boolean;
-  onClearHistory: () => void;
+  onClearHistory: () => void | Promise<void>;
   onCopyCommand: (command: string) => void;
-  onDeleteItems: (ids: string[]) => void;
+  onDeleteItems: (ids: string[]) => void | Promise<void>;
   onRefresh: () => void;
   onUseItem: (item: FfmpegCommandHistoryItem) => void;
 }) {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [isSelecting, setIsSelecting] = useState(false);
   const [presetFilter, setPresetFilter] = useState<PresetFilter>("all");
+  const [confirmAction, setConfirmAction] = useState<
+    { type: "delete"; ids: string[] } | { type: "clear"; count: number } | null
+  >(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
 
@@ -477,167 +478,247 @@ function FfmpegCommandHistoryCard({
   }
 
   function deleteSelected() {
-    onDeleteItems(selectedIds);
+    if (selectedIds.length === 0) {
+      return;
+    }
+
+    setConfirmAction({ type: "delete", ids: selectedIds });
   }
 
   function clearAll() {
+    if (history.length === 0) {
+      return;
+    }
+
+    setConfirmAction({ type: "clear", count: history.length });
+  }
+
+  function closeConfirm() {
+    if (!isMutating) {
+      setConfirmAction(null);
+    }
+  }
+
+  async function confirmHistoryMutation() {
+    if (!confirmAction || isMutating) {
+      return;
+    }
+
+    if (confirmAction.type === "delete") {
+      await onDeleteItems(confirmAction.ids);
+    } else {
+      await onClearHistory();
+    }
+
     setSelectedIds([]);
     setIsSelecting(false);
-    onClearHistory();
+    setConfirmAction(null);
   }
 
   return (
-    <Card
-      className="ffmpeg-history-card"
-      title={<PanelTitle icon={<CheckSquareOutlined />} label="命令历史" />}
-      extra={
-        <Space size={8} wrap>
-          <Button
-            className="ffmpeg-history-head-button is-refresh"
-            icon={<ReloadOutlined />}
-            loading={isLoading}
-            onClick={onRefresh}
-          >
-            刷新
-          </Button>
-          <Button
-            className="ffmpeg-history-head-button is-select"
-            disabled={filteredHistory.length === 0}
-            icon={<CheckSquareOutlined />}
-            onClick={toggleSelecting}
-          >
-            {isSelecting ? "取消选择" : "选择"}
-          </Button>
-          <Button
-            className="ffmpeg-history-head-button is-delete-selected"
-            disabled={selectedIds.length === 0}
-            icon={<DeleteOutlined />}
-            loading={isMutating && selectedIds.length > 0}
-            onClick={deleteSelected}
-          >
-            删除选中
-          </Button>
-          <Button
-            className="ffmpeg-history-head-button is-clear"
-            disabled={history.length === 0}
-            icon={<DeleteOutlined />}
-            loading={isMutating && selectedIds.length === 0}
-            onClick={clearAll}
-          >
-            清空全部
-          </Button>
-        </Space>
-      }
-    >
-      {history.length === 0 ? (
-        <Empty
-          className="ffmpeg-history-empty"
-          description="暂无命令历史"
-          image={Empty.PRESENTED_IMAGE_SIMPLE}
-        />
-      ) : (
-        <>
-          <div
-            className={`ffmpeg-history-table-head ${isSelecting ? "is-selecting" : ""}`}
-          >
-            {isSelecting ? <span aria-hidden="true" /> : null}
-            <div className="ffmpeg-history-preset-heading">
-              <Text strong>预设类型</Text>
-              <Select<PresetFilter>
-                className="ffmpeg-history-filter"
-                onChange={handlePresetFilterChange}
-                options={ffmpegHistoryPresetFilterOptions}
-                value={presetFilter}
-              />
-            </div>
-            <Text strong>命令</Text>
-          </div>
-          {filteredHistory.length === 0 ? (
-            <Empty
-              className="ffmpeg-history-empty"
-              description="该预设暂无命令历史"
-              image={Empty.PRESENTED_IMAGE_SIMPLE}
-            />
-          ) : (
-            <List
-              className="ffmpeg-history-list"
-              dataSource={pagedHistory}
+    <>
+      <Card
+        className="ffmpeg-history-card"
+        title={<PanelTitle icon={<CheckSquareOutlined />} label="命令历史" />}
+        extra={
+          <Space size={8} wrap>
+            <Button
+              className="ffmpeg-history-head-button is-refresh"
+              icon={<ReloadOutlined />}
               loading={isLoading}
-              renderItem={(item) => (
-                <List.Item
-                  className={`ffmpeg-history-item ${isSelecting ? "is-selecting" : ""}`}
-                  key={item.id}
-                >
-                  {isSelecting ? (
-                    <Checkbox
-                      checked={selectedIdSet.has(item.id)}
-                      onChange={(event) =>
-                        toggleItem(item.id, event.target.checked)
-                      }
-                    />
-                  ) : null}
-                  <div className="ffmpeg-history-preset-cell">
-                    <Tag color="blue">{presetCopy[item.presetId]}</Tag>
-                    <Text className="ffmpeg-history-time" type="secondary">
-                      {formatHistoryDate(item.createdAt)}
-                    </Text>
-                  </div>
-                  <div className="ffmpeg-history-command-cell">
-                    <Input.TextArea
-                      autoSize={{ minRows: 2, maxRows: 5 }}
-                      className="command-preview ffmpeg-history-command"
-                      readOnly
-                      value={item.command}
-                    />
-                    <Space className="ffmpeg-history-actions" size={8} wrap>
-                      <Tooltip title="复制命令">
-                        <Button
-                          aria-label="复制历史命令"
-                          className="history-action-button"
-                          icon={<CopyOutlined />}
-                          onClick={() => onCopyCommand(item.command)}
-                        />
-                      </Tooltip>
-                      <Tooltip title="填回表单">
-                        <Button
-                          aria-label="填回历史命令"
-                          className="history-action-button"
-                          icon={<FileAddOutlined />}
-                          onClick={() => onUseItem(item)}
-                        />
-                      </Tooltip>
-                    </Space>
-                  </div>
-                </List.Item>
-              )}
-            />
-          )}
-        </>
-      )}
-      <div className="ffmpeg-history-footer">
-        {shouldShowPagination ? (
-          <Pagination
-            className="ffmpeg-history-pagination"
-            current={page}
-            onChange={(nextPage, nextPageSize) => {
-              setPage(nextPage);
-              setPageSize(nextPageSize);
-            }}
-            onShowSizeChange={(_, nextPageSize) => {
-              setPage(1);
-              setPageSize(nextPageSize);
-            }}
-            pageSize={pageSize}
-            pageSizeOptions={pageSizeOptions}
-            showSizeChanger
-            total={filteredHistory.length}
+              onClick={onRefresh}
+            >
+              刷新
+            </Button>
+            <Button
+              className="ffmpeg-history-head-button is-select"
+              disabled={filteredHistory.length === 0 || isMutating}
+              icon={<CheckSquareOutlined />}
+              onClick={toggleSelecting}
+            >
+              {isSelecting ? "取消选择" : "选择"}
+            </Button>
+            <Button
+              className="ffmpeg-history-head-button is-delete-selected"
+              disabled={selectedIds.length === 0 || isMutating}
+              icon={<DeleteOutlined />}
+              loading={isMutating && selectedIds.length > 0}
+              onClick={deleteSelected}
+            >
+              删除选中
+            </Button>
+            <Button
+              className="ffmpeg-history-head-button is-clear"
+              disabled={history.length === 0 || isMutating}
+              icon={<DeleteOutlined />}
+              loading={isMutating && selectedIds.length === 0}
+              onClick={clearAll}
+            >
+              清空全部
+            </Button>
+          </Space>
+        }
+      >
+        {history.length === 0 ? (
+          <Empty
+            className="ffmpeg-history-empty"
+            description="暂无命令历史"
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
           />
-        ) : null}
-        <Text className="ffmpeg-history-count" type="secondary">
-          {historyCountCopy}
-        </Text>
-      </div>
-    </Card>
+        ) : (
+          <>
+            <div
+              className={`ffmpeg-history-table-head ${isSelecting ? "is-selecting" : ""}`}
+            >
+              {isSelecting ? <span aria-hidden="true" /> : null}
+              <div className="ffmpeg-history-preset-heading">
+                <Text strong>预设类型</Text>
+                <Select<PresetFilter>
+                  className="ffmpeg-history-filter"
+                  onChange={handlePresetFilterChange}
+                  options={ffmpegHistoryPresetFilterOptions}
+                  value={presetFilter}
+                />
+              </div>
+              <Text strong>命令</Text>
+            </div>
+            {filteredHistory.length === 0 ? (
+              <Empty
+                className="ffmpeg-history-empty"
+                description="该预设暂无命令历史"
+                image={Empty.PRESENTED_IMAGE_SIMPLE}
+              />
+            ) : (
+              <List
+                className="ffmpeg-history-list"
+                dataSource={pagedHistory}
+                loading={isLoading}
+                renderItem={(item) => {
+                  const isKnownPreset = isKnownFfmpegPresetId(item.presetId);
+
+                  return (
+                    <List.Item
+                      className={`ffmpeg-history-item ${isSelecting ? "is-selecting" : ""}`}
+                      key={item.id}
+                    >
+                      {isSelecting ? (
+                        <Checkbox
+                          checked={selectedIdSet.has(item.id)}
+                          onChange={(event) =>
+                            toggleItem(item.id, event.target.checked)
+                          }
+                        />
+                      ) : null}
+                      <div className="ffmpeg-history-preset-cell">
+                        <Tag color={isKnownPreset ? "blue" : "default"}>
+                          {ffmpegPresetLabel(item.presetId)}
+                        </Tag>
+                        <Text className="ffmpeg-history-time" type="secondary">
+                          {formatHistoryDate(item.createdAt)}
+                        </Text>
+                      </div>
+                      <div className="ffmpeg-history-command-cell">
+                        <Input.TextArea
+                          autoSize={{ minRows: 2, maxRows: 5 }}
+                          className="command-preview ffmpeg-history-command"
+                          readOnly
+                          value={item.command}
+                        />
+                        <Space className="ffmpeg-history-actions" size={8} wrap>
+                          <Tooltip title="复制命令">
+                            <Button
+                              aria-label="复制历史命令"
+                              className="history-action-button"
+                              icon={<CopyOutlined />}
+                              onClick={() => onCopyCommand(item.command)}
+                            />
+                          </Tooltip>
+                          <Tooltip
+                            title={
+                              isKnownPreset
+                                ? "填回表单"
+                                : "当前版本不支持该预设"
+                            }
+                          >
+                            <Button
+                              aria-label="填回历史命令"
+                              className="history-action-button"
+                              disabled={!isKnownPreset}
+                              icon={<FileAddOutlined />}
+                              onClick={() => onUseItem(item)}
+                            />
+                          </Tooltip>
+                        </Space>
+                      </div>
+                    </List.Item>
+                  );
+                }}
+              />
+            )}
+          </>
+        )}
+        <div className="ffmpeg-history-footer">
+          {shouldShowPagination ? (
+            <Pagination
+              className="ffmpeg-history-pagination"
+              current={page}
+              onChange={(nextPage, nextPageSize) => {
+                setPage(nextPage);
+                setPageSize(nextPageSize);
+              }}
+              onShowSizeChange={(_, nextPageSize) => {
+                setPage(1);
+                setPageSize(nextPageSize);
+              }}
+              pageSize={pageSize}
+              pageSizeOptions={pageSizeOptions}
+              showSizeChanger
+              total={filteredHistory.length}
+            />
+          ) : null}
+          <Text className="ffmpeg-history-count" type="secondary">
+            {historyCountCopy}
+          </Text>
+        </div>
+      </Card>
+      <Modal
+        centered
+        destroyOnClose
+        footer={
+          <div className="history-delete-actions">
+            <Button disabled={isMutating} onClick={closeConfirm}>
+              取消
+            </Button>
+            <Button
+              danger
+              loading={isMutating}
+              onClick={confirmHistoryMutation}
+              type="primary"
+            >
+              {confirmAction?.type === "clear" ? "清空全部" : "删除选中"}
+            </Button>
+          </div>
+        }
+        onCancel={closeConfirm}
+        open={Boolean(confirmAction)}
+        title={
+          confirmAction?.type === "clear"
+            ? "清空全部命令历史？"
+            : "删除选中的命令历史？"
+        }
+      >
+        <div className="history-delete-confirm">
+          <Text>
+            {confirmAction?.type === "clear"
+              ? `将删除全部 ${confirmAction.count} 条 FFmpeg 命令历史。`
+              : `将删除选中的 ${confirmAction?.ids.length ?? 0} 条 FFmpeg 命令历史。`}
+          </Text>
+          <Text type="secondary">
+            命令历史可能包含本地媒体文件路径，删除后无法从应用内恢复。
+          </Text>
+        </div>
+      </Modal>
+    </>
   );
 }
 
