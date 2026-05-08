@@ -8,6 +8,7 @@ import {
   List,
   message,
   Modal,
+  Popconfirm,
   Popover,
   Progress,
   Segmented,
@@ -54,6 +55,7 @@ import {
   appendFfmpegCommandHistory,
   buildFfmpegCommand,
   cancelDownload,
+  cancelYtdlpOperation,
   checkDependencies,
   checkToolUpdates,
   clearFfmpegCommandHistory,
@@ -73,6 +75,7 @@ import {
   selectMediaFile,
   selectToolExecutable,
   saveToolPath,
+  saveProxySettings,
   startDownload,
   subscribeDownloadProgress,
 } from "./tauri";
@@ -84,13 +87,18 @@ import type {
   DownloadPhase,
   DownloadQueueStatus,
   DownloadStatus,
+  ExpectedMediaInfo,
   FfmpegCommandDraft,
   FfmpegCommandHistoryItem,
   FfmpegCommandRequest,
   FfmpegPresetId,
   FormatOption,
+  LocalMediaInfo,
+  MediaComparison,
   ProbeResponse,
   ProgressEvent,
+  ProxyMode,
+  ProxyStatus,
   SupportedSiteExample,
   SupportedSitesResponse,
   ToolName,
@@ -106,6 +114,11 @@ import {
   statusCopy,
   statusTagColor,
 } from "./historyUtils";
+import {
+  localMediaErrorTitle,
+  localMediaSummary,
+  mediaComparisonSummary,
+} from "./mediaInfo";
 import { isKnownFfmpegPresetId } from "./ffmpegPresets";
 
 const { Content, Sider } = Layout;
@@ -152,7 +165,8 @@ type AuthProbeStatus =
   | "ready"
   | "warning"
   | "failed"
-  | "unavailable";
+  | "unavailable"
+  | "canceled";
 
 type AuthProbeState = {
   status: AuthProbeStatus;
@@ -167,12 +181,20 @@ type AuthProbeState = {
   error?: string | null;
 };
 
+type AuthFormatParts = {
+  detail: string;
+  fullText: string;
+  resolution: string | null;
+  score: number;
+};
+
 type QueueAuthSiteSummary = {
   site: string;
   total: number;
   ready: number;
   warning: number;
   unavailable: number;
+  canceled: number;
   checking: number;
   idle: number;
   parseFailed: number;
@@ -188,6 +210,7 @@ type QueueAuthSummary = {
   ready: number;
   warning: number;
   unavailable: number;
+  canceled: number;
   checking: number;
   idle: number;
   parseFailed: number;
@@ -218,6 +241,8 @@ type QueueItem = {
   speed?: string | null;
   eta?: string | null;
   outputPath?: string | null;
+  localMedia?: LocalMediaInfo | null;
+  mediaComparison?: MediaComparison | null;
   error?: string | null;
 };
 
@@ -267,6 +292,8 @@ export default function App() {
   const [toolSettings, setToolSettings] = useState<ToolSettings>({
     ytDlpPath: null,
     ffmpegPath: null,
+    proxyMode: "auto",
+    proxyUrl: null,
   });
   const [toolUpdates, setToolUpdates] = useState<ToolUpdates | null>(null);
   const [probe, setProbe] = useState<ProbeResponse | null>(null);
@@ -333,6 +360,9 @@ export default function App() {
   const keepNextFfmpegDraftResetRef = useRef(false);
   const authProbeRequestRef = useRef(0);
   const queueAuthProbeBatchRef = useRef(0);
+  const parseRequestRef = useRef(0);
+  const parseOperationRef = useRef<string | null>(null);
+  const authOperationIdsRef = useRef<Set<string>>(new Set());
 
   const formatOptions = useMemo<FormatOption[]>(() => {
     return probe?.formats.length ? probe.formats : fallbackFormats;
@@ -383,6 +413,15 @@ export default function App() {
         : null,
     [currentQueueItem, failedThumbnail, thumbnailLoadStates],
   );
+  const currentLocalMediaText = currentQueueItem
+    ? localMediaSummary(currentQueueItem.localMedia)
+    : null;
+  const currentLocalMediaTitle = currentQueueItem
+    ? localMediaErrorTitle(currentQueueItem.localMedia)
+    : null;
+  const currentMediaComparisonText = currentQueueItem
+    ? mediaComparisonSummary(currentQueueItem.mediaComparison)
+    : null;
   const urlLineCount = useMemo(() => parseUrlLines(url).length, [url]);
   const firstUrl = useMemo(() => parseUrlLines(url)[0] ?? "", [url]);
   const parseActionLabel = urlLineCount > 1 ? "解析队列" : "解析视频";
@@ -654,12 +693,22 @@ export default function App() {
     }
   }
 
+  function cancelAuthOperations() {
+    if (!authOperationIdsRef.current.size) {
+      return;
+    }
+
+    cancelOperationIds(authOperationIdsRef.current);
+    authOperationIdsRef.current.clear();
+  }
+
   async function refreshAuthProbe(
     trigger: "auto" | "manual" | "parse" = "manual",
   ): Promise<ProbeResponse | null> {
     const probeUrlValue = firstUrl;
     const requestId = authProbeRequestRef.current + 1;
     authProbeRequestRef.current = requestId;
+    cancelAuthOperations();
 
     if (!probeUrlValue) {
       setAuthProbe({
@@ -669,6 +718,9 @@ export default function App() {
       });
       return null;
     }
+
+    const operationId = createOperationId("auth");
+    authOperationIdsRef.current.add(operationId);
 
     setAuthProbe({
       status: "checking",
@@ -681,7 +733,7 @@ export default function App() {
     }
 
     try {
-      const result = await probeUrl(probeUrlValue, browser);
+      const result = await probeUrl(probeUrlValue, browser, operationId);
       if (authProbeRequestRef.current !== requestId) {
         return null;
       }
@@ -694,15 +746,17 @@ export default function App() {
         return null;
       }
       const nextError = readError(caught);
+      const isCanceled = isOperationCanceledError(nextError);
       setProbe(null);
       setAuthProbe({
-        status: "unavailable",
+        status: isCanceled ? "canceled" : "unavailable",
         browser,
         url: probeUrlValue,
-        error: nextError,
+        error: isCanceled ? "已停止检测。" : nextError,
       });
       return null;
     } finally {
+      authOperationIdsRef.current.delete(operationId);
       if (authProbeRequestRef.current === requestId) {
         setIsProbing(false);
       }
@@ -718,6 +772,33 @@ export default function App() {
     await refreshAuthProbe("manual");
   }
 
+  function handleAuthProbeCancel() {
+    authProbeRequestRef.current += 1;
+    queueAuthProbeBatchRef.current += 1;
+    cancelAuthOperations();
+    setIsProbing(false);
+    setAuthProbe((state) =>
+      state.status === "checking"
+        ? { ...state, status: "canceled", error: "已停止检测。" }
+        : state,
+    );
+    setQueue((items) =>
+      items.map((item) =>
+        item.authProbe?.status === "checking"
+          ? {
+              ...item,
+              authProbe: {
+                ...item.authProbe,
+                status: "canceled",
+                error: "已停止检测。",
+              },
+            }
+          : item,
+      ),
+    );
+    message.info("已停止登录态检测");
+  }
+
   async function refreshQueueAuthProbes(
     targetItems = queue,
     targetBrowser = browser,
@@ -725,6 +806,7 @@ export default function App() {
     const candidates = targetItems.filter(queueItemCanAuthProbe);
     const batchId = queueAuthProbeBatchRef.current + 1;
     queueAuthProbeBatchRef.current = batchId;
+    cancelAuthOperations();
 
     if (!candidates.length) {
       return;
@@ -758,8 +840,11 @@ export default function App() {
           return;
         }
 
+        const operationId = createOperationId("queue-auth");
+        authOperationIdsRef.current.add(operationId);
+
         try {
-          const result = await probeUrl(item.url, targetBrowser);
+          const result = await probeUrl(item.url, targetBrowser, operationId);
           if (queueAuthProbeBatchRef.current !== batchId) {
             return;
           }
@@ -784,22 +869,25 @@ export default function App() {
           }
 
           const nextError = readError(caught);
+          const isCanceled = isOperationCanceledError(nextError);
           setQueue((items) =>
             items.map((candidate) =>
               candidate.id === item.id
                 ? {
                     ...candidate,
                     authProbe: {
-                      status: "unavailable",
+                      status: isCanceled ? "canceled" : "unavailable",
                       browser: targetBrowser,
                       url: item.url,
                       site: candidate.site || siteFromUrl(item.url) || item.site,
-                      error: nextError,
+                      error: isCanceled ? "已停止检测。" : nextError,
                     },
                   }
                 : candidate,
             ),
           );
+        } finally {
+          authOperationIdsRef.current.delete(operationId);
         }
       }
     });
@@ -809,6 +897,8 @@ export default function App() {
 
   function handleBrowserChange(value: BrowserKind) {
     queueAuthProbeBatchRef.current += 1;
+    authProbeRequestRef.current += 1;
+    cancelAuthOperations();
     setBrowser(value);
     setQueue((items) =>
       items.map((item) =>
@@ -863,12 +953,20 @@ export default function App() {
       return;
     }
 
+    const requestId = parseRequestRef.current + 1;
+    const operationId = createOperationId("parse");
+    parseRequestRef.current = requestId;
+    parseOperationRef.current = operationId;
     queueAuthProbeBatchRef.current += 1;
+    cancelAuthOperations();
     setIsParsingQueue(true);
     setError(null);
 
     try {
-      const parsed = await parseDownloadQueue(urls, browser);
+      const parsed = await parseDownloadQueue(urls, browser, operationId);
+      if (parseRequestRef.current !== requestId) {
+        return;
+      }
       const nextQueue = parsed.map((item) => {
         const queueItem = queueItemFromParsed(item, browser);
         return startAfterParse && queueItem.status === "idle"
@@ -888,12 +986,36 @@ export default function App() {
       message.success(`已解析 ${nextQueue.length} 个队列项`);
       void refreshQueueAuthProbes(nextQueue, browser);
     } catch (caught) {
+      if (parseRequestRef.current !== requestId) {
+        return;
+      }
       const nextError = readError(caught);
+      if (isOperationCanceledError(nextError)) {
+        setError(null);
+        message.info("已停止解析");
+        return;
+      }
       setError(nextError);
       message.error(nextError);
     } finally {
-      setIsParsingQueue(false);
+      if (parseRequestRef.current === requestId) {
+        setIsParsingQueue(false);
+        parseOperationRef.current = null;
+      }
     }
+  }
+
+  function handleStopParseQueue() {
+    const operationId = parseOperationRef.current;
+    parseRequestRef.current += 1;
+    parseOperationRef.current = null;
+    setIsParsingQueue(false);
+
+    if (operationId) {
+      void cancelYtdlpOperation(operationId);
+    }
+
+    message.info("已停止解析");
   }
 
   function handleClearQueue() {
@@ -903,6 +1025,8 @@ export default function App() {
     }
 
     queueAuthProbeBatchRef.current += 1;
+    authProbeRequestRef.current += 1;
+    cancelAuthOperations();
     setQueue([]);
     setStatus("idle");
     setProgress(0);
@@ -987,6 +1111,8 @@ export default function App() {
               speed: null,
               eta: null,
               outputPath: null,
+              localMedia: null,
+              mediaComparison: null,
               error: null,
             }
           : candidate,
@@ -1161,6 +1287,8 @@ export default function App() {
               phaseLabel: null,
               speed: null,
               eta: null,
+              localMedia: null,
+              mediaComparison: null,
               error: null,
             }
           : candidate,
@@ -1177,6 +1305,11 @@ export default function App() {
         format: selectedFormat,
         browser,
         outputDir,
+        expectedMedia: expectedMediaForQueueItem(
+          downloadItem,
+          selectedFormat,
+          formatOptions,
+        ),
       });
     } catch (caught) {
       const nextError = readError(caught);
@@ -1480,6 +1613,24 @@ export default function App() {
     }
   }
 
+  async function handleSaveProxySettings(
+    mode: ProxyMode,
+    proxyUrl?: string | null,
+  ) {
+    setError(null);
+
+    try {
+      const nextToolSettings = await saveProxySettings(mode, proxyUrl);
+      setToolSettings(nextToolSettings);
+      await refreshDependencies();
+      message.success("已保存代理设置");
+    } catch (caught) {
+      const nextError = readError(caught);
+      setError(nextError);
+      message.error(nextError);
+    }
+  }
+
   function handleProgress(event: ProgressEvent) {
     if (!activeTaskRef.current.has(event.taskId)) {
       return;
@@ -1498,6 +1649,9 @@ export default function App() {
               speed: event.speed ?? null,
               eta: event.eta ?? null,
               outputPath: event.outputPath ?? item.outputPath ?? null,
+              localMedia: event.localMedia ?? item.localMedia ?? null,
+              mediaComparison:
+                event.mediaComparison ?? item.mediaComparison ?? null,
               error: event.error ?? null,
             }
           : item,
@@ -1553,6 +1707,8 @@ export default function App() {
               progress: 0,
               phase: null,
               phaseLabel: null,
+              localMedia: null,
+              mediaComparison: null,
               error: null,
             },
           ]
@@ -1668,6 +1824,7 @@ export default function App() {
           onChooseToolPath={handleChooseToolPath}
           onClearToolPath={handleClearToolPath}
           onRefresh={refreshToolMetadata}
+          onSaveProxySettings={handleSaveProxySettings}
           toolSettings={toolSettings}
           toolUpdates={toolUpdates}
         />
@@ -1712,6 +1869,8 @@ export default function App() {
                       onChange={(event) => {
                         const nextUrl = event.target.value;
                         queueAuthProbeBatchRef.current += 1;
+                        authProbeRequestRef.current += 1;
+                        cancelAuthOperations();
                         setUrl(nextUrl);
                         setQueue([]);
                         setAuthProbe({
@@ -1726,13 +1885,15 @@ export default function App() {
                   </div>
                   <Button
                     className="url-probe-button"
-                    disabled={!url.trim()}
-                    icon={<SearchOutlined />}
-                    loading={isParsingQueue}
-                    onClick={() => handleParseQueue()}
-                    type="primary"
+                    danger={isParsingQueue}
+                    disabled={!isParsingQueue && !url.trim()}
+                    icon={isParsingQueue ? <StopOutlined /> : <SearchOutlined />}
+                    onClick={() =>
+                      isParsingQueue ? handleStopParseQueue() : handleParseQueue()
+                    }
+                    type={isParsingQueue ? "default" : "primary"}
                   >
-                    {parseActionLabel}
+                    {isParsingQueue ? "停止解析" : parseActionLabel}
                   </Button>
                 </div>
                 <Text className="batch-helper" type="secondary">
@@ -1760,6 +1921,7 @@ export default function App() {
                       onRefresh={() => {
                         void handleAuthProbeRefresh();
                       }}
+                      onCancel={handleAuthProbeCancel}
                       queueSummary={queueAuthSummary}
                       state={authProbe}
                     />
@@ -1943,6 +2105,9 @@ export default function App() {
                         </Text>
                       ) : null}
                     </div>
+                    <Text className="download-status-runtime" type="secondary">
+                      {`${currentQueueItem.speed ?? "-"} / ${currentQueueItem.eta ?? "-"}`}
+                    </Text>
                     <div className="download-status-progress-summary">
                       <span aria-hidden="true" className="download-status-phase-dot" />
                       <Text className="download-status-phase-value" strong>
@@ -1955,6 +2120,21 @@ export default function App() {
                     </div>
                   </div>
 
+                  {currentLocalMediaText ? (
+                    <div className="download-status-media-info">
+                      <Tooltip title={currentLocalMediaTitle}>
+                        <Text className="download-status-media-summary" type="secondary">
+                          {currentLocalMediaText}
+                        </Text>
+                      </Tooltip>
+                      {currentMediaComparisonText ? (
+                        <Text className="download-status-media-comparison" type="secondary">
+                          {currentMediaComparisonText}
+                        </Text>
+                      ) : null}
+                    </div>
+                  ) : null}
+
                   <div className="download-status-progress-row">
                     <Progress
                       percent={Math.round(currentQueueItem.progress)}
@@ -1962,13 +2142,6 @@ export default function App() {
                       size="small"
                       status={queueProgressStatus(currentQueueItem.status)}
                     />
-                  </div>
-
-                  <div className="download-status-footer">
-                    <div className="download-status-metrics">
-                      <Metric label="下载速度" value={currentQueueItem.speed ?? "-"} />
-                      <Metric label="剩余时间" value={currentQueueItem.eta ?? "-"} />
-                    </div>
                   </div>
                 </div>
               </div>
@@ -1993,8 +2166,15 @@ export default function App() {
               <List
                 className="queue-list"
                 dataSource={queue}
-                renderItem={(item) => (
-                  <List.Item className="queue-item" key={item.id}>
+                renderItem={(item) => {
+                  const mediaText = localMediaSummary(item.localMedia);
+                  const mediaTitle = localMediaErrorTitle(item.localMedia);
+                  const comparisonText = mediaComparisonSummary(
+                    item.mediaComparison,
+                  );
+
+                  return (
+                    <List.Item className="queue-item" key={item.id}>
                     <div className="queue-item-main">
                       <div className="queue-title-row">
                         <Tag className={`queue-status-tag is-${item.status}`}>
@@ -2028,6 +2208,18 @@ export default function App() {
                       {queueRuntimeMeta(item) ? (
                         <Text className="queue-runtime-meta" type="secondary">
                           {queueRuntimeMeta(item)}
+                        </Text>
+                      ) : null}
+                      {mediaText ? (
+                        <Tooltip title={mediaTitle}>
+                          <Text className="queue-media-meta" type="secondary">
+                            {mediaText}
+                          </Text>
+                        </Tooltip>
+                      ) : null}
+                      {comparisonText ? (
+                        <Text className="queue-media-comparison" type="secondary">
+                          {comparisonText}
                         </Text>
                       ) : null}
                       {item.error ? (
@@ -2076,19 +2268,27 @@ export default function App() {
                           </Tooltip>
                         ) : null}
                         {item.status !== "running" ? (
-                          <Tooltip title="移除">
+                          <Popconfirm
+                            cancelText="取消"
+                            description="任务会从队列中移除，已下载文件不会被删除。"
+                            okButtonProps={{ danger: true }}
+                            okText="移除"
+                            onConfirm={() => handleRemoveQueueItem(item)}
+                            placement="topRight"
+                            title="移除这个下载任务？"
+                          >
                             <Button
                               aria-label={`移除 ${item.title}`}
-                              className="history-action-button queue-danger-button"
+                              className="history-action-button queue-remove-button"
                               icon={<DeleteOutlined />}
-                              onClick={() => handleRemoveQueueItem(item)}
                             />
-                          </Tooltip>
+                          </Popconfirm>
                         ) : null}
                       </Space>
                     </div>
-                  </List.Item>
-                )}
+                    </List.Item>
+                  );
+                }}
               />
             )}
           </Card>
@@ -2275,6 +2475,7 @@ function SidebarHistoryPreview({
               const title = historyTitle(item);
               const site = historySite(item);
               const itemStatus = statusCopy[item.status] ?? "未知状态";
+              const mediaText = localMediaSummary(item.localMedia, "");
 
               return (
                 <List.Item
@@ -2287,7 +2488,7 @@ function SidebarHistoryPreview({
                 >
                   <Text className="history-name">{title}</Text>
                   <Text className="history-meta">
-                    {site} · {itemStatus}
+                    {[site, itemStatus, mediaText].filter(Boolean).join(" · ")}
                   </Text>
                 </List.Item>
               );
@@ -2328,6 +2529,7 @@ function SidebarDependencyPanel({
   onChooseToolPath,
   onClearToolPath,
   onRefresh,
+  onSaveProxySettings,
   toolSettings,
   toolUpdates,
 }: {
@@ -2337,6 +2539,7 @@ function SidebarDependencyPanel({
   onChooseToolPath: (tool: ToolName) => void;
   onClearToolPath: (tool: ToolName) => void;
   onRefresh: () => void;
+  onSaveProxySettings: (mode: ProxyMode, proxyUrl?: string | null) => void;
   toolSettings: ToolSettings;
   toolUpdates: ToolUpdates | null;
 }) {
@@ -2353,6 +2556,7 @@ function SidebarDependencyPanel({
               onChooseToolPath={onChooseToolPath}
               onClearToolPath={onClearToolPath}
               onRefresh={onRefresh}
+              onSaveProxySettings={onSaveProxySettings}
               toolSettings={toolSettings}
               toolUpdates={toolUpdates}
             />
@@ -2424,6 +2628,12 @@ function SidebarDependencyPanel({
             tool={dependencies.ffmpeg}
             update={toolUpdates?.ffmpeg ?? null}
           />
+          <ProxyTag
+            onSaveProxySettings={onSaveProxySettings}
+            placement="rightBottom"
+            proxy={dependencies.proxy}
+            toolSettings={toolSettings}
+          />
         </Space>
         <Tooltip title="重新检测">
           <Button
@@ -2447,6 +2657,7 @@ function CollapsedDependencyPopover({
   onChooseToolPath,
   onClearToolPath,
   onRefresh,
+  onSaveProxySettings,
   toolSettings,
   toolUpdates,
 }: {
@@ -2455,6 +2666,7 @@ function CollapsedDependencyPopover({
   onChooseToolPath: (tool: ToolName) => void;
   onClearToolPath: (tool: ToolName) => void;
   onRefresh: () => void;
+  onSaveProxySettings: (mode: ProxyMode, proxyUrl?: string | null) => void;
   toolSettings: ToolSettings;
   toolUpdates: ToolUpdates | null;
 }) {
@@ -2509,6 +2721,13 @@ function CollapsedDependencyPopover({
             onClearToolPath={onClearToolPath}
             tool={dependencies.ffmpeg}
             update={toolUpdates?.ffmpeg ?? null}
+          />
+        </div>
+        <div className="sidebar-dependency-popover-tool">
+          <ProxyPopover
+            onSaveProxySettings={onSaveProxySettings}
+            proxy={dependencies.proxy}
+            toolSettings={toolSettings}
           />
         </div>
       </div>
@@ -2570,6 +2789,125 @@ function DependencyTag({
   );
 }
 
+function ProxyTag({
+  onSaveProxySettings,
+  placement = "bottomRight",
+  proxy,
+  toolSettings,
+}: {
+  onSaveProxySettings: (mode: ProxyMode, proxyUrl?: string | null) => void;
+  placement?: "bottomRight" | "rightBottom";
+  proxy: ProxyStatus;
+  toolSettings: ToolSettings;
+}) {
+  const hasProxy = Boolean(proxy.effectiveProxy);
+  const isWarning = proxy.source === "pacUnsupported" || proxy.source === "error";
+  const statusClass = isWarning ? "has-warning" : hasProxy ? "is-ready" : "is-checking";
+
+  return (
+    <Popover
+      content={
+        <ProxyPopover
+          onSaveProxySettings={onSaveProxySettings}
+          proxy={proxy}
+          toolSettings={toolSettings}
+        />
+      }
+      placement={placement}
+      trigger="click"
+    >
+      <Tag
+        aria-label={`代理：${proxyStatusText(proxy)}`}
+        className={`dependency-tag ${statusClass}`}
+      >
+        <span className="dependency-tag-dot" aria-hidden="true" />
+        <span className="dependency-tag-label">代理</span>
+      </Tag>
+    </Popover>
+  );
+}
+
+function ProxyPopover({
+  onSaveProxySettings,
+  proxy,
+  toolSettings,
+}: {
+  onSaveProxySettings: (mode: ProxyMode, proxyUrl?: string | null) => void;
+  proxy: ProxyStatus;
+  toolSettings: ToolSettings;
+}) {
+  const [draftMode, setDraftMode] = useState<ProxyMode>(
+    toolSettings.proxyMode ?? proxy.mode ?? "auto",
+  );
+  const [draftProxyUrl, setDraftProxyUrl] = useState(
+    toolSettings.proxyUrl ?? proxy.effectiveProxy ?? "",
+  );
+
+  useEffect(() => {
+    setDraftMode(toolSettings.proxyMode ?? proxy.mode ?? "auto");
+    setDraftProxyUrl(toolSettings.proxyUrl ?? proxy.effectiveProxy ?? "");
+  }, [proxy.effectiveProxy, proxy.mode, toolSettings.proxyMode, toolSettings.proxyUrl]);
+
+  const canSave =
+    draftMode !== "manual" ||
+    /^(https?|socks5h?):\/\//i.test(draftProxyUrl.trim());
+
+  return (
+    <div className="dependency-popover proxy-popover">
+      <Text type="secondary">代理设置</Text>
+      <div className="dependency-popover-detail">
+        <Text strong>当前模式</Text>
+        <Text>{proxyModeLabel(proxy.mode)}</Text>
+      </div>
+      <div className="dependency-popover-detail">
+        <Text strong>生效代理</Text>
+        <Text className="dependency-path">
+          {proxy.effectiveProxy ?? "未传入代理"}
+        </Text>
+      </div>
+      <div className="dependency-popover-detail">
+        <Text strong>来源</Text>
+        <Text>{proxySourceLabel(proxy)}</Text>
+      </div>
+      {proxy.message ? (
+        <Alert message={proxy.message} showIcon type={proxyAlertType(proxy)} />
+      ) : null}
+      <div className="proxy-settings-form">
+        <Select<ProxyMode>
+          className="proxy-mode-select"
+          onChange={setDraftMode}
+          options={[
+            { label: "自动读取", value: "auto" },
+            { label: "手动指定", value: "manual" },
+            { label: "不使用代理", value: "off" },
+          ]}
+          value={draftMode}
+        />
+        {draftMode === "manual" ? (
+          <Input
+            onChange={(event) => setDraftProxyUrl(event.target.value)}
+            placeholder="http://127.0.0.1:7890"
+            value={draftProxyUrl}
+          />
+        ) : null}
+        <Button
+          disabled={!canSave}
+          onClick={() =>
+            onSaveProxySettings(
+              draftMode,
+              draftMode === "manual" ? draftProxyUrl.trim() : null,
+            )
+          }
+          size="small"
+          type="primary"
+        >
+          保存代理设置
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function SupportedSiteExamples({
   examples,
   onChoose,
@@ -2608,7 +2946,7 @@ function QueueAuthProbeLine({ item }: { item: QueueItem }) {
   const status = queueItemAuthStatus(item);
   const tagText = queueItemAuthTagText(item);
   const details = queueItemAuthDetails(item);
-  const formatText = queueItemBestFormatText(item);
+  const formatParts = queueItemBestFormatParts(item);
 
   return (
     <div className="queue-auth-row">
@@ -2628,9 +2966,30 @@ function QueueAuthProbeLine({ item }: { item: QueueItem }) {
       >
         <Tag className={`queue-auth-tag is-${status}`}>{tagText}</Tag>
       </Popover>
-      {formatText ? (
-        <Text className="queue-auth-format" type="secondary">
-          {formatText}
+      {formatParts ? (
+        <Text
+          className="queue-auth-format"
+          title={formatParts.fullText}
+          type="secondary"
+        >
+          <span className="queue-auth-format-prefix">最高可下载：</span>
+          {formatParts.resolution ? (
+            <>
+              <span className="queue-auth-format-resolution">
+                {formatParts.resolution}
+              </span>
+              {formatParts.detail ? (
+                <span className="queue-auth-format-detail">
+                  {" · "}
+                  {formatParts.detail}
+                </span>
+              ) : null}
+            </>
+          ) : (
+            <span className="queue-auth-format-detail">
+              {formatParts.detail}
+            </span>
+          )}
         </Text>
       ) : null}
     </div>
@@ -2641,6 +3000,7 @@ function AuthProbePanel({
   browser,
   canRefresh,
   isChecking,
+  onCancel,
   onRefresh,
   queueSummary,
   state,
@@ -2648,18 +3008,12 @@ function AuthProbePanel({
   browser: BrowserKind;
   canRefresh: boolean;
   isChecking: boolean;
+  onCancel: () => void;
   onRefresh: () => void;
   queueSummary?: QueueAuthSummary | null;
   state: AuthProbeState;
 }) {
-  const isQueueMode = Boolean(queueSummary?.total);
   const status = queueSummary?.status ?? state.status;
-  const statusText = queueSummary
-    ? queueAuthStatusText(queueSummary)
-    : authProbeStatusText(state);
-  const details = queueSummary
-    ? queueAuthDetails(queueSummary)
-    : authProbeDetails(state);
   const hint = queueSummary ? queueAuthHint(queueSummary) : authProbeHint(state);
   const triggerText = queueSummary
     ? queueAuthTriggerText(queueSummary)
@@ -2669,22 +3023,20 @@ function AuthProbePanel({
     <div className="auth-probe-controls">
       <Popover
         content={
-          <div className={`auth-probe-popover is-${status}`}>
-            <div className="auth-probe-popover-head">
-              <Text strong>
-                {isQueueMode ? "队列登录态详情" : `${browserLabel(browser)} 登录态详情`}
-              </Text>
-            </div>
-            <Text className="auth-probe-status" type="secondary">
-              {statusText}
-            </Text>
-            {details ? (
-              <Text className="auth-probe-details" type="secondary">
-                {details}
-              </Text>
-            ) : null}
-            {hint ? <Text className="auth-probe-hint">{hint}</Text> : null}
-          </div>
+          queueSummary ? (
+            <QueueAuthPopoverContent
+              hint={hint}
+              status={status}
+              summary={queueSummary}
+            />
+          ) : (
+            <SingleAuthPopoverContent
+              browser={browser}
+              hint={hint}
+              state={state}
+              status={status}
+            />
+          )
         }
         placement="bottom"
         trigger="click"
@@ -2698,14 +3050,14 @@ function AuthProbePanel({
           <span className="auth-probe-trigger-text">{triggerText}</span>
         </Button>
       </Popover>
-      <Tooltip title="重新检测登录态">
+      <Tooltip title={isChecking ? "停止检测" : "重新检测登录态"}>
         <Button
-          aria-label="重新检测登录态"
+          aria-label={isChecking ? "停止检测登录态" : "重新检测登录态"}
           className="auth-probe-refresh-button"
-          disabled={!canRefresh || isChecking}
-          icon={<ReloadOutlined />}
-          loading={isChecking}
-          onClick={onRefresh}
+          danger={isChecking}
+          disabled={!canRefresh && !isChecking}
+          icon={isChecking ? <StopOutlined /> : <ReloadOutlined />}
+          onClick={isChecking ? onCancel : onRefresh}
           size="small"
           type="text"
         />
@@ -2714,12 +3066,175 @@ function AuthProbePanel({
   );
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
+function QueueAuthPopoverContent({
+  hint,
+  status,
+  summary,
+}: {
+  hint: string | null;
+  status: AuthProbeStatus;
+  summary: QueueAuthSummary;
+}) {
+  const highestSites =
+    summary.sites.length > 1 ? queueHighestAuthSites(summary) : new Set<string>();
+
   return (
-    <div className="metric">
-      <Text type="secondary">{label}</Text>
-      <Text strong>{value}</Text>
+    <div className={`auth-probe-popover is-${status}`}>
+      <div className="auth-probe-popover-head">
+        <Text strong>队列登录态详情</Text>
+      </div>
+      <AuthProbeStatusSummary
+        label={queueAuthSummaryLabel(summary)}
+        meta={queueAuthSummaryMeta(summary)}
+        status={status}
+      />
+      {summary.sites.length ? (
+        <div className="auth-probe-site-list">
+          {summary.sites.map((site) => (
+            <AuthProbeSiteRow
+              isHighest={highestSites.has(site.site)}
+              key={site.site}
+              site={site}
+            />
+          ))}
+        </div>
+      ) : null}
+      {hint ? <Text className="auth-probe-hint">{hint}</Text> : null}
     </div>
+  );
+}
+
+function SingleAuthPopoverContent({
+  browser,
+  hint,
+  state,
+  status,
+}: {
+  browser: BrowserKind;
+  hint: string | null;
+  state: AuthProbeState;
+  status: AuthProbeStatus;
+}) {
+  const shouldShowSiteRow = state.status === "ready" || state.status === "warning";
+  const details = shouldShowSiteRow ? null : authProbeDetails(state);
+
+  return (
+    <div className={`auth-probe-popover is-${status}`}>
+      <div className="auth-probe-popover-head">
+        <Text strong>{browserLabel(browser)} 登录态详情</Text>
+      </div>
+      <AuthProbeStatusSummary
+        label={authProbeStatusLabel(state)}
+        meta={authProbeStatusMeta(state)}
+        status={status}
+      />
+      {shouldShowSiteRow ? (
+        <div className="auth-probe-site-list">
+          <AuthProbeSingleSiteRow state={state} />
+        </div>
+      ) : null}
+      {details ? (
+        <Text className="auth-probe-message" type="secondary">
+          {details}
+        </Text>
+      ) : null}
+      {hint ? <Text className="auth-probe-hint">{hint}</Text> : null}
+    </div>
+  );
+}
+
+function AuthProbeStatusSummary({
+  label,
+  meta,
+  status,
+}: {
+  label: string;
+  meta: string | null;
+  status: AuthProbeStatus;
+}) {
+  return (
+    <div className={`auth-probe-summary is-${status}`}>
+      <span className="auth-probe-summary-dot" aria-hidden="true" />
+      <span className={`auth-probe-summary-pill is-${status}`}>{label}</span>
+      {meta ? <span className="auth-probe-summary-meta">{meta}</span> : null}
+    </div>
+  );
+}
+
+function AuthProbeSiteRow({
+  isHighest,
+  site,
+}: {
+  isHighest: boolean;
+  site: QueueAuthSiteSummary;
+}) {
+  const status = site.status ?? queueAuthSiteStatus(site);
+  const formatParts =
+    site.ready + site.warning > 0
+      ? bestFormatParts(site.bestFormatLabel)
+      : null;
+  const message = formatParts ? null : queueAuthSiteMessage(site);
+
+  return (
+    <div
+      className={`auth-probe-site-row is-${status}${isHighest ? " is-highest" : ""}`}
+    >
+      <div className="auth-probe-site-main">
+        <span className="auth-probe-site-name">{site.site}</span>
+        {isHighest ? <span className="auth-probe-highest-pill">最高</span> : null}
+        <span className={`auth-probe-site-count is-${status}`}>
+          {queueAuthSiteCountText(site)}
+        </span>
+      </div>
+      <div className="auth-probe-site-format">
+        {formatParts ? (
+          <AuthProbeFormat parts={formatParts} />
+        ) : (
+          <span className="auth-probe-site-message">{message}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AuthProbeSingleSiteRow({ state }: { state: AuthProbeState }) {
+  const formatParts = bestFormatParts(state.bestFormatLabel);
+  const site = state.site?.trim() || siteFromUrl(state.url) || "当前链接";
+
+  return (
+    <div className={`auth-probe-site-row is-${state.status}`}>
+      <div className="auth-probe-site-main">
+        <span className="auth-probe-site-name">{site}</span>
+        <span className={`auth-probe-site-count is-${state.status}`}>
+          {authProbeSiteCountText(state)}
+        </span>
+      </div>
+      <div className="auth-probe-site-format">
+        <AuthProbeFormat parts={formatParts} />
+      </div>
+    </div>
+  );
+}
+
+function AuthProbeFormat({ parts }: { parts: AuthFormatParts }) {
+  return (
+    <span className="auth-probe-format" title={parts.fullText}>
+      {parts.resolution ? (
+        <>
+          <span className="auth-probe-format-resolution">
+            {parts.resolution}
+          </span>
+          {parts.detail ? (
+            <span className="auth-probe-format-detail">
+              {" · "}
+              {parts.detail}
+            </span>
+          ) : null}
+        </>
+      ) : (
+        <span className="auth-probe-format-detail">{parts.detail}</span>
+      )}
+    </span>
   );
 }
 
@@ -3056,6 +3571,8 @@ function queueItemFromParsed(item: BatchParseItem, browser: BrowserKind): QueueI
     speed: null,
     eta: null,
     outputPath: null,
+    localMedia: null,
+    mediaComparison: null,
     error: item.error ?? null,
   };
 }
@@ -3094,6 +3611,7 @@ function summarizeQueueAuth(items: QueueItem[]): QueueAuthSummary | null {
     ready: 0,
     warning: 0,
     unavailable: 0,
+    canceled: 0,
     checking: 0,
     idle: 0,
     parseFailed: 0,
@@ -3114,6 +3632,7 @@ function summarizeQueueAuth(items: QueueItem[]): QueueAuthSummary | null {
         ready: 0,
         warning: 0,
         unavailable: 0,
+        canceled: 0,
         checking: 0,
         idle: 0,
         parseFailed: 0,
@@ -3142,6 +3661,10 @@ function summarizeQueueAuth(items: QueueItem[]): QueueAuthSummary | null {
       summary.unavailable += 1;
       siteSummary.unavailable += 1;
       siteSummary.error ??= item.authProbe?.error ?? item.error ?? null;
+    } else if (status === "canceled") {
+      summary.canceled += 1;
+      siteSummary.canceled += 1;
+      siteSummary.error ??= item.authProbe?.error ?? null;
     } else if (status === "checking") {
       summary.checking += 1;
       siteSummary.checking += 1;
@@ -3196,6 +3719,38 @@ function mergeQueueMetadata(item: QueueItem, result: ProbeResponse): QueueItem {
     duration: result.duration ?? item.duration,
     thumbnail: result.thumbnail ?? item.thumbnail,
   };
+}
+
+function expectedMediaForQueueItem(
+  item: QueueItem,
+  selectedFormat: string,
+  formatOptions: FormatOption[],
+): ExpectedMediaInfo | null {
+  const selectedOption = formatOptions.find(
+    (format) => format.selector === selectedFormat,
+  );
+  const duration = item.authProbe?.duration ?? item.duration ?? null;
+  const explicitResolution = selectedOption?.resolution?.trim();
+  const isAudioOnly = explicitResolution?.toLowerCase() === "audio";
+  const selectedResolution =
+    explicitResolution &&
+    !["自动", "audio"].includes(explicitResolution.toLowerCase())
+      ? explicitResolution
+      : null;
+  const resolutionSource = isAudioOnly
+    ? null
+    : selectedResolution ?? item.authProbe?.bestFormatLabel?.trim() ?? null;
+  const resolutionParts = bestFormatParts(resolutionSource);
+  const resolutionLabel = resolutionParts.score > 0
+    ? resolutionParts.resolution
+    : null;
+  const expected: ExpectedMediaInfo = {
+    duration,
+    resolutionLabel,
+    resolutionScore: resolutionParts.score > 0 ? resolutionParts.score : null,
+  };
+
+  return expected.duration || expected.resolutionScore ? expected : null;
 }
 
 function queueMetadataProbeKey(
@@ -3464,6 +4019,59 @@ function toolSourceLabel(source?: ToolSource | null) {
   return source ? toolSourceCopy[source] : "未识别";
 }
 
+function proxyModeLabel(mode?: ProxyMode | null) {
+  if (mode === "manual") {
+    return "手动指定";
+  }
+
+  if (mode === "off") {
+    return "不使用代理";
+  }
+
+  return "自动读取";
+}
+
+function proxyStatusText(proxy: ProxyStatus) {
+  if (proxy.effectiveProxy) {
+    return `${proxyModeLabel(proxy.mode)} · ${proxy.effectiveProxy}`;
+  }
+
+  return proxy.message ?? proxyModeLabel(proxy.mode);
+}
+
+function proxySourceLabel(proxy: ProxyStatus) {
+  switch (proxy.source) {
+    case "manual":
+      return "手动指定";
+    case "off":
+      return "已关闭";
+    case "systemHttps":
+      return "macOS HTTPS";
+    case "systemHttp":
+      return "macOS HTTP";
+    case "systemSocks":
+      return "macOS SOCKS";
+    case "pacUnsupported":
+      return "PAC 暂不支持";
+    case "none":
+      return "系统未配置";
+    case "unsupported":
+      return "当前平台暂不支持";
+    case "error":
+      return "读取失败";
+    default:
+      return proxy.source ?? "未识别";
+  }
+}
+
+function proxyAlertType(proxy: ProxyStatus): "success" | "info" | "warning" {
+  if (proxy.source === "error" || proxy.source === "pacUnsupported") {
+    return "warning";
+  }
+
+  return proxy.effectiveProxy ? "success" : "info";
+}
+
 function formatUnixTime(value: string) {
   const seconds = Number(value);
   if (!Number.isFinite(seconds) || seconds <= 0) {
@@ -3496,6 +4104,20 @@ function parentPath(path: string) {
 
 function readError(value: unknown) {
   return value instanceof Error ? value.message : String(value);
+}
+
+function createOperationId(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function isOperationCanceledError(value: string) {
+  return value.includes("操作已停止") || value.includes("已停止");
+}
+
+function cancelOperationIds(ids: Iterable<string>) {
+  Array.from(ids).forEach((operationId) => {
+    void cancelYtdlpOperation(operationId);
+  });
 }
 
 function queueItemCanAuthProbe(item: QueueItem) {
@@ -3551,6 +4173,10 @@ function queueItemAuthTagText(item: QueueItem) {
     return "无法检测";
   }
 
+  if (status === "canceled") {
+    return "已停止";
+  }
+
   if (status === "failed") {
     return item.parseError ? "解析失败" : "检测失败";
   }
@@ -3558,14 +4184,19 @@ function queueItemAuthTagText(item: QueueItem) {
   return "待检测";
 }
 
-function queueItemBestFormatText(item: QueueItem) {
+function queueItemBestFormatParts(item: QueueItem) {
   const status = queueItemAuthStatus(item);
 
   if (status !== "ready" && status !== "warning") {
     return null;
   }
 
-  return `最高可下载：${item.authProbe?.bestFormatLabel ?? "未返回明确视频格式"}`;
+  const parts = bestFormatParts(item.authProbe?.bestFormatLabel);
+
+  return {
+    ...parts,
+    fullText: `最高可下载：${parts.fullText}`,
+  };
 }
 
 function queueItemAuthDetails(item: QueueItem) {
@@ -3581,6 +4212,10 @@ function queueItemAuthDetails(item: QueueItem) {
 
   if (status === "unavailable" || status === "failed") {
     return item.authProbe?.error ?? "当前链接未能完成视频探测。";
+  }
+
+  if (status === "canceled") {
+    return item.authProbe?.error ?? "已停止检测。";
   }
 
   if (status === "idle") {
@@ -3608,6 +4243,10 @@ function queueAuthSummaryStatus(summary: QueueAuthSummary): AuthProbeStatus {
     return "unavailable";
   }
 
+  if (summary.canceled > 0 && summary.ready + summary.warning + summary.idle === 0) {
+    return "canceled";
+  }
+
   if (summary.warning > 0) {
     return "warning";
   }
@@ -3628,6 +4267,10 @@ function queueAuthSiteStatus(site: QueueAuthSiteSummary): AuthProbeStatus {
     return "unavailable";
   }
 
+  if (site.canceled > 0 && site.ready + site.warning + site.idle === 0) {
+    return "canceled";
+  }
+
   if (site.warning > 0) {
     return "warning";
   }
@@ -3639,34 +4282,6 @@ function queueAuthSiteStatus(site: QueueAuthSiteSummary): AuthProbeStatus {
   return "idle";
 }
 
-function queueAuthStatusText(summary: QueueAuthSummary) {
-  if (summary.checking > 0) {
-    return `正在检测队列登录态：${summary.ready}/${summary.probeable} 项可用。`;
-  }
-
-  if (summary.unavailable > 0 || summary.parseFailed > 0) {
-    if (summary.probeable === 0) {
-      return `队列链接均解析失败：${summary.parseFailed} 项异常。`;
-    }
-
-    return `队列登录态部分异常：${summary.ready}/${summary.probeable} 项可用，${summary.unavailable + summary.parseFailed} 项异常。`;
-  }
-
-  if (summary.warning > 0) {
-    return `队列登录态需注意：${summary.ready}/${summary.probeable} 项可用，${summary.warning} 项需确认权限。`;
-  }
-
-  if (summary.ready > 0) {
-    if (summary.idle > 0) {
-      return `队列登录态待检测：${summary.ready}/${summary.probeable} 项已检测。`;
-    }
-
-    return `队列登录态可用：${summary.ready}/${summary.probeable} 项已检测。`;
-  }
-
-  return "解析队列后可检测每个链接的登录态。";
-}
-
 function queueAuthTriggerText(summary: QueueAuthSummary) {
   if (summary.checking > 0) {
     return "队列检测中";
@@ -3674,6 +4289,10 @@ function queueAuthTriggerText(summary: QueueAuthSummary) {
 
   if (summary.unavailable > 0 || summary.parseFailed > 0) {
     return "队列部分异常";
+  }
+
+  if (summary.canceled > 0 && summary.ready + summary.warning + summary.idle === 0) {
+    return "队列已停止";
   }
 
   if (summary.warning > 0) {
@@ -3687,34 +4306,122 @@ function queueAuthTriggerText(summary: QueueAuthSummary) {
   return "队列待检测";
 }
 
-function queueAuthDetails(summary: QueueAuthSummary) {
-  const siteDetails = summary.sites
-    .map((site) => {
-      const bestFormat = site.bestFormatLabel
-        ? `最高 ${site.bestFormatLabel}`
-        : site.ready + site.warning > 0
-          ? "最高 未返回明确视频格式"
-          : null;
-      const counts = [
-        site.ready ? `${site.ready} 可用` : null,
-        site.warning ? `${site.warning} 注意` : null,
-        site.checking ? `${site.checking} 检测中` : null,
-        site.unavailable + site.parseFailed
-          ? `${site.unavailable + site.parseFailed} 异常`
-          : null,
-      ].filter(Boolean);
+function queueAuthSummaryLabel(summary: QueueAuthSummary) {
+  if (summary.checking > 0) {
+    return "检测中";
+  }
 
-      return [site.site, counts.join("/"), bestFormat].filter(Boolean).join(" · ");
-    })
-    .join("\n");
+  if (summary.unavailable > 0 || summary.parseFailed > 0) {
+    return summary.probeable === 0 ? "均异常" : "部分异常";
+  }
 
-  const bestFormat = summary.bestFormatLabel
-    ? `队列最高可下载：${summary.bestFormatLabel}`
-    : summary.ready + summary.warning > 0
-      ? "队列最高可下载：未返回明确视频格式"
-      : null;
+  if (summary.canceled > 0 && summary.ready + summary.warning + summary.idle === 0) {
+    return "已停止";
+  }
 
-  return [bestFormat, siteDetails].filter(Boolean).join("\n");
+  if (summary.warning > 0) {
+    return "需注意";
+  }
+
+  if (summary.ready > 0 && summary.idle === 0) {
+    return "全部可用";
+  }
+
+  if (summary.ready > 0) {
+    return "部分可用";
+  }
+
+  return "待检测";
+}
+
+function queueAuthSummaryMeta(summary: QueueAuthSummary) {
+  if (summary.probeable === 0) {
+    return summary.parseFailed > 0 ? `${summary.parseFailed} 项异常` : null;
+  }
+
+  if (summary.unavailable > 0 || summary.parseFailed > 0) {
+    return `${summary.ready}/${summary.probeable} 可用 · ${
+      summary.unavailable + summary.parseFailed
+    } 异常`;
+  }
+
+  if (summary.warning > 0) {
+    return `${summary.ready}/${summary.probeable} 可用 · ${summary.warning} 需确认`;
+  }
+
+  if (summary.canceled > 0) {
+    return `${summary.canceled} 项已停止`;
+  }
+
+  if (summary.checking > 0) {
+    const checked = Math.max(0, summary.probeable - summary.idle - summary.checking);
+    return `${checked}/${summary.probeable} 已检测`;
+  }
+
+  if (summary.ready > 0) {
+    return `${summary.ready}/${summary.probeable} 已检测`;
+  }
+
+  return `${summary.probeable} 项待检测`;
+}
+
+function queueHighestAuthSites(summary: QueueAuthSummary) {
+  const readySites = summary.sites.filter(
+    (site) => site.ready > 0 && site.bestFormatLabel,
+  );
+  const candidates = readySites.length
+    ? readySites
+    : summary.sites.filter((site) => site.warning > 0 && site.bestFormatLabel);
+  const scoredSites = candidates
+    .map((site) => ({
+      score: bestFormatParts(site.bestFormatLabel).score,
+      site,
+    }))
+    .filter(({ score }) => score > 0);
+  const highestScore = Math.max(0, ...scoredSites.map(({ score }) => score));
+
+  return new Set(
+    scoredSites
+      .filter(({ score }) => score === highestScore)
+      .map(({ site }) => site.site),
+  );
+}
+
+function queueAuthSiteCountText(site: QueueAuthSiteSummary) {
+  const counts = [
+    site.ready ? `${site.ready} 可用` : null,
+    site.warning ? `${site.warning} 注意` : null,
+    site.checking ? `${site.checking} 检测中` : null,
+    site.canceled ? `${site.canceled} 已停止` : null,
+    site.unavailable + site.parseFailed
+      ? `${site.unavailable + site.parseFailed} 异常`
+      : null,
+    site.idle ? `${site.idle} 待检测` : null,
+  ].filter(Boolean);
+
+  return counts.join(" / ") || `${site.total} 项`;
+}
+
+function queueAuthSiteMessage(site: QueueAuthSiteSummary) {
+  const status = site.status ?? queueAuthSiteStatus(site);
+
+  if (status === "checking") {
+    return "正在检测可用格式";
+  }
+
+  if (status === "idle") {
+    return "待检测";
+  }
+
+  if (status === "canceled") {
+    return site.error ?? "已停止检测";
+  }
+
+  if (status === "unavailable" || status === "failed") {
+    return site.error ?? "当前站点未能完成视频探测";
+  }
+
+  return "未返回明确视频格式";
 }
 
 function queueAuthHint(summary: QueueAuthSummary) {
@@ -3724,6 +4431,10 @@ function queueAuthHint(summary: QueueAuthSummary) {
 
   if (summary.unavailable > 0 || summary.parseFailed > 0) {
     return "部分队列项无法检测，请查看对应队列行的错误原因。";
+  }
+
+  if (summary.canceled > 0 && summary.ready + summary.warning + summary.idle === 0) {
+    return "登录态检测已停止。";
   }
 
   if (summary.warning > 0) {
@@ -3749,12 +4460,111 @@ function betterFormatLabel(
 }
 
 function formatLabelScore(value: string) {
-  const text = value.toLowerCase();
-  const resolutionMatch = text.match(/(\d{3,4})p/);
-  const resolution = resolutionMatch ? Number(resolutionMatch[1]) : 0;
-  const bonus = text.includes("4k") || text.includes("2160") ? 2160 : 0;
+  return bestFormatParts(value).score;
+}
 
-  return Math.max(resolution, bonus);
+function bestFormatParts(value?: string | null): AuthFormatParts {
+  const fallbackText = "未返回明确视频格式";
+  const fullText = value?.trim();
+
+  if (!fullText) {
+    return {
+      detail: fallbackText,
+      fullText: fallbackText,
+      resolution: null,
+      score: 0,
+    };
+  }
+
+  const parts = fullText
+    .split(" · ")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const scoredParts = parts.map((part) => ({
+    part,
+    score: resolutionScoreFromText(part),
+    isActualResolution: isActualResolutionText(part),
+    isFallbackResolution: isFallbackResolutionText(part),
+  }));
+  const resolutionPart = scoredParts.find(
+    ({ isActualResolution, score }) => isActualResolution && score > 0,
+  );
+  const score =
+    resolutionPart?.score ??
+    scoredParts.find(({ score }) => score > 0)?.score ??
+    0;
+  const detailParts = parts.filter((part) => {
+    if (resolutionPart && part === resolutionPart.part) {
+      return false;
+    }
+
+    return !isFallbackResolutionText(part);
+  });
+  const detail = detailParts.join(" · ") || fallbackText;
+
+  if (!resolutionPart) {
+    return {
+      detail,
+      fullText,
+      resolution: null,
+      score,
+    };
+  }
+
+  return {
+    detail: detail === fallbackText ? "" : detail,
+    fullText,
+    resolution: resolutionPart.part,
+    score,
+  };
+}
+
+function isActualResolutionText(value: string) {
+  return /(\d{3,5})\s*[x×]\s*(\d{3,5})/.test(value.toLowerCase());
+}
+
+function isFallbackResolutionText(value: string) {
+  const text = value.toLowerCase().trim();
+
+  return (
+    /\b\d{3,4}\s*p\b/.test(text) ||
+    /\b[248]k\b/.test(text) ||
+    text.includes("uhd") ||
+    text.includes("qhd")
+  );
+}
+
+function resolutionScoreFromText(value: string) {
+  const text = value.toLowerCase();
+  const dimensionMatch = text.match(/(\d{3,5})\s*[x×]\s*(\d{3,5})/);
+
+  if (dimensionMatch) {
+    const width = Number(dimensionMatch[1]);
+    const height = Number(dimensionMatch[2]);
+    return width * height;
+  }
+
+  const progressiveMatch = text.match(/\b(\d{3,4})\s*p\b/);
+
+  if (progressiveMatch) {
+    const height = Number(progressiveMatch[1]);
+    const width = Math.round((height * 16) / 9);
+    return width * height;
+  }
+
+  if (/\b8k\b/.test(text)) {
+    return 7680 * 4320;
+  }
+
+  if (/\b4k\b/.test(text) || text.includes("uhd")) {
+    return 3840 * 2160;
+  }
+
+  if (/\b2k\b/.test(text) || text.includes("qhd")) {
+    return 2560 * 1440;
+  }
+
+  return 0;
 }
 
 function authProbeStateFromResult(
@@ -3775,34 +4585,6 @@ function authProbeStateFromResult(
   };
 }
 
-function authProbeStatusText(state: AuthProbeState) {
-  if (!state.url) {
-    return "输入链接后可检测登录态。";
-  }
-
-  if (state.status === "checking") {
-    return "正在读取当前浏览器登录态并探测视频信息。";
-  }
-
-  if (state.status === "failed") {
-    return "登录态检测异常，请检查浏览器账号状态后重试。";
-  }
-
-  if (state.status === "unavailable") {
-    return "无法检测当前链接，请先确认链接有效、网络可用。";
-  }
-
-  if (state.status === "warning") {
-    return "检测到下载结果可能短于真实时长，请检查网站账号权限或重新检测登录态。";
-  }
-
-  if (state.status === "ready") {
-    return "已检测当前浏览器登录态。";
-  }
-
-  return "等待检测当前浏览器登录态。";
-}
-
 function authProbeTriggerText(state: AuthProbeState) {
   if (!state.url) {
     return "待检测";
@@ -3820,6 +4602,10 @@ function authProbeTriggerText(state: AuthProbeState) {
     return "无法检测";
   }
 
+  if (state.status === "canceled") {
+    return "已停止";
+  }
+
   if (state.status === "warning") {
     return "需注意";
   }
@@ -3829,6 +4615,80 @@ function authProbeTriggerText(state: AuthProbeState) {
   }
 
   return "待检测";
+}
+
+function authProbeStatusLabel(state: AuthProbeState) {
+  if (!state.url) {
+    return "待检测";
+  }
+
+  if (state.status === "checking") {
+    return "检测中";
+  }
+
+  if (state.status === "failed") {
+    return "检测失败";
+  }
+
+  if (state.status === "unavailable") {
+    return "无法检测";
+  }
+
+  if (state.status === "canceled") {
+    return "已停止";
+  }
+
+  if (state.status === "warning") {
+    return "需注意";
+  }
+
+  if (state.status === "ready") {
+    return "登录态可用";
+  }
+
+  return "待检测";
+}
+
+function authProbeStatusMeta(state: AuthProbeState) {
+  if (state.status === "checking") {
+    return "正在探测视频信息";
+  }
+
+  if (state.status === "canceled") {
+    return "已停止检测";
+  }
+
+  if (state.status === "ready" || state.status === "warning") {
+    const parts = [
+      state.duration ? formatDuration(state.duration) : null,
+      state.formatCount ? `${state.formatCount} 个格式` : null,
+      state.checkedAt ? `检测于 ${formatProbeTime(state.checkedAt)}` : null,
+    ].filter(Boolean);
+
+    return parts.join(" · ") || null;
+  }
+
+  if (!state.url) {
+    return "输入链接后可检测";
+  }
+
+  return null;
+}
+
+function authProbeSiteCountText(state: AuthProbeState) {
+  if (state.status === "warning") {
+    return "需注意";
+  }
+
+  if (state.status === "canceled") {
+    return "已停止";
+  }
+
+  if (state.formatCount) {
+    return `${state.formatCount} 格式`;
+  }
+
+  return "可用";
 }
 
 function authProbeDetails(state: AuthProbeState) {
@@ -3862,6 +4722,10 @@ function authProbeHint(state: AuthProbeState) {
 
   if (state.status === "unavailable") {
     return "当前链接未能完成视频探测，这通常表示链接失效、视频不可访问或网络暂时不可用。";
+  }
+
+  if (state.status === "canceled") {
+    return "登录态检测已停止。";
   }
 
   if (state.status !== "warning") {

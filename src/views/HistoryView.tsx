@@ -15,6 +15,11 @@ import {
   statusCopy,
   statusTagColor,
 } from "../historyUtils";
+import {
+  localMediaErrorTitle,
+  localMediaSummary,
+  mediaComparisonSummary,
+} from "../mediaInfo";
 import { revealFile } from "../tauri";
 import type { DownloadHistoryItem } from "../types";
 
@@ -58,6 +63,9 @@ export default function HistoryView({
             const title = historyTitle(item);
             const site = historySite(item);
             const itemStatus = statusCopy[item.status] ?? "未知状态";
+            const mediaText = localMediaSummary(item.localMedia);
+            const mediaTitle = localMediaErrorTitle(item.localMedia);
+            const comparisonText = mediaComparisonSummary(item.mediaComparison);
 
             return (
               <List.Item
@@ -80,6 +88,18 @@ export default function HistoryView({
                     <Text type="secondary">格式：{item.format || "-"}</Text>
                     <Text type="secondary">目录：{item.outputDir || "-"}</Text>
                   </div>
+                  {mediaText ? (
+                    <Tooltip title={mediaTitle}>
+                      <Text className="history-page-media" type="secondary">
+                        {mediaText}
+                      </Text>
+                    </Tooltip>
+                  ) : null}
+                  {comparisonText ? (
+                    <Text className="history-page-media-comparison" type="secondary">
+                      {comparisonText}
+                    </Text>
+                  ) : null}
                   {item.error ? (
                     <Text className="history-page-error" type="danger">
                       {item.error}

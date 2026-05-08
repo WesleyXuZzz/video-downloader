@@ -4,6 +4,19 @@ export type ToolName = "yt-dlp" | "ffmpeg";
 
 export type ToolSource = "manual" | "env" | "path";
 
+export type ProxyMode = "auto" | "manual" | "off";
+
+export type ProxySource =
+  | "manual"
+  | "off"
+  | "none"
+  | "systemHttps"
+  | "systemHttp"
+  | "systemSocks"
+  | "pacUnsupported"
+  | "unsupported"
+  | "error";
+
 export type DownloadStatus =
   | "idle"
   | "running"
@@ -38,11 +51,21 @@ export interface ToolStatus {
 export interface ToolSettings {
   ytDlpPath?: string | null;
   ffmpegPath?: string | null;
+  proxyMode?: ProxyMode | null;
+  proxyUrl?: string | null;
+}
+
+export interface ProxyStatus {
+  mode: ProxyMode;
+  effectiveProxy?: string | null;
+  source?: ProxySource | string | null;
+  message?: string | null;
 }
 
 export interface DependencyStatus {
   ytDlp: ToolStatus;
   ffmpeg: ToolStatus;
+  proxy: ProxyStatus;
   ready: boolean;
   installHint: string;
 }
@@ -94,6 +117,13 @@ export interface DownloadRequest {
   format: string;
   browser?: BrowserKind | null;
   outputDir: string;
+  expectedMedia?: ExpectedMediaInfo | null;
+}
+
+export interface ExpectedMediaInfo {
+  duration?: number | null;
+  resolutionLabel?: string | null;
+  resolutionScore?: number | null;
 }
 
 export interface BatchParseItem {
@@ -123,6 +153,8 @@ export interface DownloadHistoryItem {
   status: DownloadStatus;
   progress: number;
   outputPath?: string | null;
+  localMedia?: LocalMediaInfo | null;
+  mediaComparison?: MediaComparison | null;
   error?: string | null;
   updatedAt: string;
 }
@@ -137,7 +169,30 @@ export interface ProgressEvent {
   eta?: string | null;
   line?: string | null;
   outputPath?: string | null;
+  localMedia?: LocalMediaInfo | null;
+  mediaComparison?: MediaComparison | null;
   error?: string | null;
+}
+
+export interface LocalMediaInfo {
+  duration?: number | null;
+  width?: number | null;
+  height?: number | null;
+  videoCodec?: string | null;
+  audioCodec?: string | null;
+  probedAt?: string | null;
+  error?: string | null;
+}
+
+export interface MediaComparison {
+  duration?: MediaComparisonDetail | null;
+  resolution?: MediaComparisonDetail | null;
+}
+
+export interface MediaComparisonDetail {
+  status: "shorter" | "longer" | "lower" | "higher";
+  expectedLabel?: string | null;
+  actualLabel?: string | null;
 }
 
 export interface FfmpegCommandRequest {

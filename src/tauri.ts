@@ -12,6 +12,8 @@ import type {
   FfmpegCommandHistoryItem,
   FfmpegCommandRequest,
   ProgressEvent,
+  ProxyMode,
+  ProxyStatus,
   ProbeResponse,
   SupportedSitesResponse,
   TerminalPrefillResult,
@@ -28,8 +30,11 @@ const mockTimers = new Map<string, number>();
 const mockToolSettings: ToolSettings = {
   ytDlpPath: null,
   ffmpegPath: null,
+  proxyMode: "auto",
+  proxyUrl: null,
 };
 const mockFfmpegCommandHistory: FfmpegCommandHistoryItem[] = [];
+const mockCanceledOperations = new Set<string>();
 const MOCK_DOWNLOAD_DIR = "Downloads";
 
 export function isTauriRuntime() {
@@ -77,6 +82,7 @@ export async function checkDependencies(): Promise<DependencyStatus> {
         version: ffmpegInstalled ? "mock" : null,
         source: ffmpegInstalled ? "manual" : null,
       },
+      proxy: mockProxyStatus(),
       ready: ytDlpInstalled && ffmpegInstalled,
       installHint: "brew install yt-dlp ffmpeg",
     };
@@ -159,12 +165,26 @@ export async function clearToolPath(tool: ToolName): Promise<ToolSettings> {
   return invoke<ToolSettings>("clear_tool_path", { tool });
 }
 
+export async function saveProxySettings(
+  mode: ProxyMode,
+  proxyUrl?: string | null,
+): Promise<ToolSettings> {
+  if (!isTauriRuntime()) {
+    mockToolSettings.proxyMode = mode;
+    mockToolSettings.proxyUrl = mode === "manual" ? (proxyUrl ?? null) : null;
+    return { ...mockToolSettings };
+  }
+
+  return invoke<ToolSettings>("save_proxy_settings", { mode, proxyUrl });
+}
+
 export async function probeUrl(
   url: string,
   browser: BrowserKind,
+  operationId?: string | null,
 ): Promise<ProbeResponse> {
   if (!isTauriRuntime()) {
-    await delay(520);
+    await delay(520, operationId);
     return {
       title: "Sample video · visual preview",
       site: "Generic",
@@ -174,7 +194,7 @@ export async function probeUrl(
       checkedBrowser: browser,
       checkedAt: String(Math.floor(Date.now() / 1000)),
       formatCount: 3,
-      bestFormatLabel: "1080p · mp4 · h264",
+      bestFormatLabel: "1920x1080 · mp4 · H.264",
       formats: [
         {
           id: "best",
@@ -185,10 +205,10 @@ export async function probeUrl(
         },
         {
           id: "1080p",
-          label: "1080p · mp4 · h264",
+          label: "1920x1080 · mp4 · H.264",
           selector: "bv*[height<=1080]+ba/b",
           ext: "mp4",
-          resolution: "1080p",
+          resolution: "1920x1080",
           vcodec: "h264",
         },
         {
@@ -201,7 +221,7 @@ export async function probeUrl(
     };
   }
 
-  return invoke<ProbeResponse>("probe_url", { url, browser });
+  return invoke<ProbeResponse>("probe_url", { url, browser, operationId });
 }
 
 export async function startDownload(
@@ -218,9 +238,10 @@ export async function startDownload(
 export async function parseDownloadQueue(
   urls: string[],
   browser: BrowserKind,
+  operationId?: string | null,
 ): Promise<BatchParseItem[]> {
   if (!isTauriRuntime()) {
-    await delay(520);
+    await delay(520, operationId);
     return urls.flatMap<BatchParseItem>((url, index) => {
       if (isMockPlaylistUrl(url)) {
         return [1, 2, 3].map((entry) => ({
@@ -261,7 +282,17 @@ export async function parseDownloadQueue(
   return invoke<BatchParseItem[]>("parse_download_queue", {
     urls,
     browser,
+    operationId,
   });
+}
+
+export async function cancelYtdlpOperation(operationId: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    mockCanceledOperations.add(operationId);
+    return;
+  }
+
+  return invoke<void>("cancel_ytdlp_operation", { operationId });
 }
 
 export async function cancelDownload(taskId: string): Promise<void> {
@@ -522,6 +553,19 @@ function runMockDownload(taskId: string) {
         progress >= 100
           ? `${MOCK_DOWNLOAD_DIR}/sample-video.mp4`
           : undefined,
+      localMedia:
+        progress >= 100
+          ? {
+              duration: 481,
+              width: 1920,
+              height: 1080,
+              videoCodec: "h264",
+              audioCodec: "aac",
+              probedAt: String(Math.floor(Date.now() / 1000)),
+              error: null,
+            }
+          : undefined,
+      mediaComparison: null,
     });
 
     if (progress >= 100) {
@@ -537,8 +581,55 @@ function emitMock(event: ProgressEvent) {
   mockListeners.forEach((listener) => listener(event));
 }
 
-function delay(milliseconds: number) {
-  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+function delay(milliseconds: number, operationId?: string | null) {
+  return new Promise<void>((resolve, reject) => {
+    const startedAt = Date.now();
+    const tick = () => {
+      if (operationId && mockCanceledOperations.has(operationId)) {
+        mockCanceledOperations.delete(operationId);
+        reject(new Error("操作已停止。"));
+        return;
+      }
+
+      if (Date.now() - startedAt >= milliseconds) {
+        resolve();
+        return;
+      }
+
+      window.setTimeout(tick, 40);
+    };
+
+    tick();
+  });
+}
+
+function mockProxyStatus(): ProxyStatus {
+  const mode = mockToolSettings.proxyMode ?? "auto";
+
+  if (mode === "manual") {
+    return {
+      mode,
+      effectiveProxy: mockToolSettings.proxyUrl ?? null,
+      source: "manual",
+      message: mockToolSettings.proxyUrl ? "手动指定代理" : "请填写手动代理地址。",
+    };
+  }
+
+  if (mode === "off") {
+    return {
+      mode,
+      effectiveProxy: null,
+      source: "off",
+      message: "不使用代理",
+    };
+  }
+
+  return {
+    mode: "auto",
+    effectiveProxy: null,
+    source: "none",
+    message: "未检测到系统代理",
+  };
 }
 
 function mockFfmpegCommand(

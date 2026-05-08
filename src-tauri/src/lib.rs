@@ -5,7 +5,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
@@ -19,11 +19,14 @@ use tauri::{AppHandle, Emitter, Manager};
 
 const FALLBACK_TOOL_DIRS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
 const FFMPEG_COMMAND_HISTORY_LIMIT: usize = 500;
+const DEFAULT_YTDLP_FORMAT_SELECTOR: &str = "bv*+ba/b";
+const YTDLP_OPERATION_CANCELED_MESSAGE: &str = "操作已停止。";
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct AppState {
     tasks: Mutex<HashMap<String, TaskControl>>,
+    ytdlp_operations: Mutex<HashMap<String, YtdlpOperationControl>>,
     history_lock: Mutex<()>,
     ffmpeg_command_history_lock: Mutex<()>,
     tool_settings_lock: Mutex<()>,
@@ -35,11 +38,18 @@ struct TaskControl {
     canceled: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+struct YtdlpOperationControl {
+    child: Arc<Mutex<Child>>,
+    canceled: Arc<AtomicBool>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DependencyStatus {
     yt_dlp: ToolStatus,
     ffmpeg: ToolStatus,
+    proxy: ProxyStatus,
     ready: bool,
     install_hint: String,
 }
@@ -78,6 +88,24 @@ struct ToolStatus {
 struct ToolSettings {
     yt_dlp_path: Option<String>,
     ffmpeg_path: Option<String>,
+    proxy_mode: Option<String>,
+    proxy_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxyStatus {
+    mode: String,
+    effective_proxy: Option<String>,
+    source: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyMode {
+    Auto,
+    Manual,
+    Off,
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +213,15 @@ struct DownloadRequest {
     format: String,
     browser: Option<String>,
     output_dir: String,
+    expected_media: Option<ExpectedMediaInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ExpectedMediaInfo {
+    duration: Option<f64>,
+    resolution_label: Option<String>,
+    resolution_score: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -295,6 +332,8 @@ struct HistoryItem {
     status: String,
     progress: f64,
     output_path: Option<String>,
+    local_media: Option<LocalMediaInfo>,
+    media_comparison: Option<MediaComparison>,
     error: Option<String>,
     updated_at: String,
 }
@@ -311,7 +350,36 @@ struct ProgressEvent {
     eta: Option<String>,
     line: Option<String>,
     output_path: Option<String>,
+    local_media: Option<LocalMediaInfo>,
+    media_comparison: Option<MediaComparison>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LocalMediaInfo {
+    duration: Option<f64>,
+    width: Option<u64>,
+    height: Option<u64>,
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
+    probed_at: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MediaComparison {
+    duration: Option<MediaComparisonDetail>,
+    resolution: Option<MediaComparisonDetail>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaComparisonDetail {
+    status: String,
+    expected_label: Option<String>,
+    actual_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,6 +448,7 @@ impl Default for ProgressSnapshot {
 async fn check_dependencies(app: AppHandle) -> Result<DependencyStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
+        let settings = read_tool_settings_with_fallback(&state);
         let yt_dlp = tool_status(&state, "yt-dlp");
         let ffmpeg = tool_status(&state, "ffmpeg");
         let ready = yt_dlp.installed && ffmpeg.installed;
@@ -387,6 +456,7 @@ async fn check_dependencies(app: AppHandle) -> Result<DependencyStatus, String> 
         DependencyStatus {
             yt_dlp,
             ffmpeg,
+            proxy: proxy_status(&settings),
             ready,
             install_hint: "brew install yt-dlp ffmpeg".to_string(),
         }
@@ -504,6 +574,31 @@ async fn clear_tool_path(app: AppHandle, tool: String) -> Result<ToolSettings, S
 }
 
 #[tauri::command]
+async fn save_proxy_settings(
+    app: AppHandle,
+    mode: String,
+    proxy_url: Option<String>,
+) -> Result<ToolSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let mode = normalize_proxy_mode(Some(mode.as_str()));
+        let proxy_url = normalize_proxy_url(proxy_url.as_deref(), mode)?;
+
+        let _guard = state
+            .tool_settings_lock
+            .lock()
+            .map_err(|_| "工具路径设置锁已损坏。".to_string())?;
+        let mut settings = read_tool_settings_unlocked()?;
+        settings.proxy_mode = Some(mode.as_str().to_string());
+        settings.proxy_url = proxy_url;
+        write_tool_settings_unlocked(&settings)?;
+        Ok(settings)
+    })
+    .await
+    .map_err(|error| format!("保存代理设置失败：{error}"))?
+}
+
+#[tauri::command]
 fn default_download_dir() -> Option<String> {
     dirs::download_dir().map(|path| path.to_string_lossy().to_string())
 }
@@ -513,29 +608,39 @@ async fn probe_url(
     app: AppHandle,
     url: String,
     browser: Option<String>,
+    operation_id: Option<String>,
 ) -> Result<ProbeResponse, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         validate_url(&url)?;
-        let yt_dlp_path = ensure_tool(&state, "yt-dlp")?;
+        let settings = read_tool_settings_with_fallback(&state);
+        let yt_dlp_path = ensure_tool_with_settings(&settings, "yt-dlp")?;
         let checked_browser = normalized_browser(browser);
 
         let mut command = Command::new(&yt_dlp_path);
-        apply_tool_env(&state, &mut command);
+        apply_tool_env_from_settings(&settings, &mut command);
+        apply_ytdlp_proxy_from_settings(&settings, &mut command)?;
         command
             .arg("--dump-single-json")
             .arg("--skip-download")
             .arg("--no-warnings")
             .arg("--no-playlist")
             .arg("--socket-timeout")
-            .arg("30");
+            .arg("30")
+            .arg("-f")
+            .arg(DEFAULT_YTDLP_FORMAT_SELECTOR);
 
         if let Some(browser) = checked_browser.as_deref() {
             command.arg("--cookies-from-browser").arg(browser);
         }
 
         command.arg(&url);
-        let output = run_command_with_timeout(command, Duration::from_secs(45))?;
+        let output = run_ytdlp_command_with_timeout(
+            &state,
+            command,
+            Duration::from_secs(45),
+            operation_id.as_deref(),
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -554,7 +659,7 @@ async fn probe_url(
             .and_then(Value::as_array)
             .map(Vec::len)
             .unwrap_or(0);
-        let best_format_label = best_format_label(&formats);
+        let best_format_label = best_format_label_from_json(&json, &formats);
 
         Ok(ProbeResponse {
             title: string_field(&json, "title").unwrap_or_else(|| "Untitled video".to_string()),
@@ -580,10 +685,12 @@ async fn parse_download_queue(
     app: AppHandle,
     urls: Vec<String>,
     browser: Option<String>,
+    operation_id: Option<String>,
 ) -> Result<Vec<BatchParseItem>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let yt_dlp_path = ensure_tool(&state, "yt-dlp")?;
+        let settings = read_tool_settings_with_fallback(&state);
+        let yt_dlp_path = ensure_tool_with_settings(&settings, "yt-dlp")?;
         let browser = normalized_browser(browser);
         let mut items = Vec::new();
 
@@ -596,23 +703,37 @@ async fn parse_download_queue(
             }
             source_order += 1;
 
-            match parse_queue_url(&state, &yt_dlp_path, &url, browser.as_deref(), source_order) {
+            match parse_queue_url(
+                &state,
+                &settings,
+                &yt_dlp_path,
+                &url,
+                browser.as_deref(),
+                source_order,
+                operation_id.as_deref(),
+            ) {
                 Ok(mut parsed) => items.append(&mut parsed),
-                Err(error) => items.push(BatchParseItem {
-                    id: uuid_like_id(),
-                    url: url.clone(),
-                    title: None,
-                    site: None,
-                    duration: None,
-                    thumbnail: None,
-                    source_url: None,
-                    playlist_title: None,
-                    playlist_index: None,
-                    playlist_total: None,
-                    source_order: Some(source_order),
-                    is_playlist_item: false,
-                    error: Some(error),
-                }),
+                Err(error) => {
+                    if error == YTDLP_OPERATION_CANCELED_MESSAGE {
+                        return Err(error);
+                    }
+
+                    items.push(BatchParseItem {
+                        id: uuid_like_id(),
+                        url: url.clone(),
+                        title: None,
+                        site: None,
+                        duration: None,
+                        thumbnail: None,
+                        source_url: None,
+                        playlist_title: None,
+                        playlist_index: None,
+                        playlist_total: None,
+                        source_order: Some(source_order),
+                        is_playlist_item: false,
+                        error: Some(error),
+                    });
+                }
             }
         }
 
@@ -627,15 +748,17 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         validate_url(&request.url)?;
-        let yt_dlp_path = ensure_tool(&state, "yt-dlp")?;
-        let ffmpeg_path = ensure_tool(&state, "ffmpeg")?;
+        let settings = read_tool_settings_with_fallback(&state);
+        let yt_dlp_path = ensure_tool_with_settings(&settings, "yt-dlp")?;
+        let ffmpeg_path = ensure_tool_with_settings(&settings, "ffmpeg")?;
 
         let output_dir = PathBuf::from(&request.output_dir);
         fs::create_dir_all(&output_dir)
             .map_err(|error| format!("无法创建保存目录 {}：{error}", output_dir.display()))?;
 
         let mut command = Command::new(&yt_dlp_path);
-        apply_tool_env(&state, &mut command);
+        apply_tool_env_from_settings(&settings, &mut command);
+        apply_ytdlp_proxy_from_settings(&settings, &mut command)?;
         command
             .arg("--progress")
             .arg("--newline")
@@ -715,6 +838,8 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                 status: "running".to_string(),
                 progress: 0.0,
                 output_path: None,
+                local_media: None,
+                media_comparison: None,
                 error: None,
                 updated_at: unix_timestamp(),
             },
@@ -729,6 +854,8 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
         let shared_progress = Arc::new(Mutex::new(ProgressSnapshot::default()));
         let progress_for_stdout = Arc::clone(&shared_progress);
         let progress_for_stderr = Arc::clone(&shared_progress);
+        let expected_media = request.expected_media.clone();
+        let ffmpeg_path_for_probe = ffmpeg_path.clone();
 
         thread::spawn(move || {
             let mut reader = BufReader::new(stderr);
@@ -758,6 +885,8 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                             eta: parsed.eta,
                             line: Some(line.trim().to_string()),
                             output_path: None,
+                            local_media: None,
+                            media_comparison: None,
                             error: None,
                         },
                     );
@@ -775,6 +904,8 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                             eta: None,
                             line: Some(line.trim().to_string()),
                             output_path: None,
+                            local_media: None,
+                            media_comparison: None,
                             error: None,
                         },
                     );
@@ -812,6 +943,8 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                             eta: parsed.eta,
                             line: Some(line),
                             output_path: output_path.clone(),
+                            local_media: None,
+                            media_comparison: None,
                             error: None,
                         },
                     );
@@ -830,6 +963,8 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                             eta: None,
                             line: Some(line),
                             output_path: output_path.clone(),
+                            local_media: None,
+                            media_comparison: None,
                             error: None,
                         },
                     );
@@ -869,6 +1004,23 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
             } else {
                 shared_progress.lock().ok().map(|snapshot| snapshot.phase)
             };
+            let app_state = app_for_stdout.state::<AppState>();
+            let (local_media, media_comparison) = if final_status == "completed" {
+                let media = output_path
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .map(|path| probe_local_media(&app_state, &ffmpeg_path_for_probe, &path))
+                    .unwrap_or_else(|| LocalMediaInfo {
+                        probed_at: Some(unix_timestamp()),
+                        error: Some("yt-dlp 未返回最终文件路径，无法读取本地媒体信息。".to_string()),
+                        ..Default::default()
+                    });
+                let comparison = compare_media(expected_media.as_ref(), &media);
+
+                (Some(media), comparison)
+            } else {
+                (None, None)
+            };
 
             let _ = app_for_stdout.emit(
                 "download-progress",
@@ -882,17 +1034,20 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                     eta: None,
                     line: None,
                     output_path: output_path.clone(),
+                    local_media: local_media.clone(),
+                    media_comparison: media_comparison.clone(),
                     error: error.clone(),
                 },
             );
 
-            let app_state = app_for_stdout.state::<AppState>();
             let _ = update_history_status(
                 &app_state,
                 &task_for_stdout,
                 final_status,
                 progress,
                 output_path,
+                local_media,
+                media_comparison,
                 error,
             );
 
@@ -933,7 +1088,7 @@ async fn cancel_download(app: AppHandle, task_id: String) -> Result<(), String> 
                 .map_err(|error| format!("取消下载失败：{error}"))?;
         }
 
-        update_history_status(&state, &task_id, "canceled", 0.0, None, None)?;
+        update_history_status(&state, &task_id, "canceled", 0.0, None, None, None, None)?;
 
         let _ = app.emit(
             "download-progress",
@@ -947,6 +1102,8 @@ async fn cancel_download(app: AppHandle, task_id: String) -> Result<(), String> 
                 eta: None,
                 line: None,
                 output_path: None,
+                local_media: None,
+                media_comparison: None,
                 error: None,
             },
         );
@@ -955,6 +1112,33 @@ async fn cancel_download(app: AppHandle, task_id: String) -> Result<(), String> 
     })
     .await
     .map_err(|error| format!("取消下载任务失败：{error}"))?
+}
+
+#[tauri::command]
+async fn cancel_ytdlp_operation(app: AppHandle, operation_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let control = {
+            let mut operations = state
+                .ytdlp_operations
+                .lock()
+                .map_err(|_| "yt-dlp 操作状态锁已损坏。".to_string())?;
+            operations.remove(&operation_id)
+        };
+
+        let Some(control) = control else {
+            return Ok(());
+        };
+
+        control.canceled.store(true, Ordering::SeqCst);
+        if let Ok(mut child) = control.child.lock() {
+            let _ = child.kill();
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("停止 yt-dlp 操作失败：{error}"))?
 }
 
 #[tauri::command]
@@ -1156,11 +1340,13 @@ pub fn run() {
             load_tool_settings,
             save_tool_path,
             clear_tool_path,
+            save_proxy_settings,
             default_download_dir,
             probe_url,
             parse_download_queue,
             start_download,
             cancel_download,
+            cancel_ytdlp_operation,
             reveal_file,
             load_history,
             delete_history_item,
@@ -1194,15 +1380,18 @@ fn uuid_like_id() -> String {
 
 fn parse_queue_url(
     state: &AppState,
+    settings: &ToolSettings,
     yt_dlp_path: &Path,
     url: &str,
     browser: Option<&str>,
     source_order: usize,
+    operation_id: Option<&str>,
 ) -> Result<Vec<BatchParseItem>, String> {
     validate_url(url)?;
 
     let mut command = Command::new(yt_dlp_path);
-    apply_tool_env(state, &mut command);
+    apply_tool_env_from_settings(settings, &mut command);
+    apply_ytdlp_proxy_from_settings(settings, &mut command)?;
     command
         .arg("--dump-single-json")
         .arg("--skip-download")
@@ -1218,7 +1407,8 @@ fn parse_queue_url(
 
     command.arg(url);
 
-    let output = run_command_with_timeout(command, Duration::from_secs(60))?;
+    let output =
+        run_ytdlp_command_with_timeout(state, command, Duration::from_secs(60), operation_id)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
@@ -1938,6 +2128,259 @@ fn apply_tool_env_from_settings(settings: &ToolSettings, command: &mut Command) 
     command.env("PATH", enhanced_path_env_from_settings(settings));
 }
 
+fn apply_ytdlp_proxy_from_settings(
+    settings: &ToolSettings,
+    command: &mut Command,
+) -> Result<(), String> {
+    match normalize_proxy_mode(settings.proxy_mode.as_deref()) {
+        ProxyMode::Manual => {
+            let proxy = normalize_proxy_url(settings.proxy_url.as_deref(), ProxyMode::Manual)?
+                .ok_or_else(|| "请填写手动代理地址。".to_string())?;
+            command.arg("--proxy").arg(proxy);
+        }
+        ProxyMode::Off => {
+            command.arg("--proxy").arg("");
+        }
+        ProxyMode::Auto => {
+            if let Some(proxy) = proxy_status(settings).effective_proxy {
+                command.arg("--proxy").arg(proxy);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_proxy_mode(value: Option<&str>) -> ProxyMode {
+    match value.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
+        "manual" => ProxyMode::Manual,
+        "off" | "none" | "disabled" => ProxyMode::Off,
+        _ => ProxyMode::Auto,
+    }
+}
+
+impl ProxyMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+            Self::Off => "off",
+        }
+    }
+}
+
+fn normalize_proxy_url(value: Option<&str>, mode: ProxyMode) -> Result<Option<String>, String> {
+    if mode != ProxyMode::Manual {
+        return Ok(None);
+    }
+
+    let value = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "请填写手动代理地址。".to_string())?;
+    validate_proxy_url(value)?;
+    Ok(Some(value.to_string()))
+}
+
+fn validate_proxy_url(value: &str) -> Result<(), String> {
+    let lower = value.to_ascii_lowercase();
+    let supported = ["http://", "https://", "socks5://", "socks5h://"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+
+    if supported {
+        Ok(())
+    } else {
+        Err("代理地址仅支持 http://、https://、socks5:// 或 socks5h://。".to_string())
+    }
+}
+
+fn proxy_status(settings: &ToolSettings) -> ProxyStatus {
+    let mode = normalize_proxy_mode(settings.proxy_mode.as_deref());
+
+    match mode {
+        ProxyMode::Manual => match normalize_proxy_url(settings.proxy_url.as_deref(), mode) {
+            Ok(Some(proxy)) => ProxyStatus {
+                mode: mode.as_str().to_string(),
+                effective_proxy: Some(proxy),
+                source: Some("manual".to_string()),
+                message: Some("手动指定代理".to_string()),
+            },
+            Ok(None) => ProxyStatus {
+                mode: mode.as_str().to_string(),
+                effective_proxy: None,
+                source: Some("manual".to_string()),
+                message: Some("请填写手动代理地址。".to_string()),
+            },
+            Err(error) => ProxyStatus {
+                mode: mode.as_str().to_string(),
+                effective_proxy: None,
+                source: Some("manual".to_string()),
+                message: Some(error),
+            },
+        },
+        ProxyMode::Off => ProxyStatus {
+            mode: mode.as_str().to_string(),
+            effective_proxy: None,
+            source: Some("off".to_string()),
+            message: Some("不使用代理".to_string()),
+        },
+        ProxyMode::Auto => auto_proxy_status(),
+    }
+}
+
+fn auto_proxy_status() -> ProxyStatus {
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("scutil");
+        command.arg("--proxy");
+        return match run_command_with_timeout_named(command, Duration::from_secs(4), "系统代理读取")
+        {
+            Ok(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                proxy_status_from_scutil_output(&text)
+            }
+            Ok(output) => {
+                let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                ProxyStatus {
+                    mode: ProxyMode::Auto.as_str().to_string(),
+                    effective_proxy: None,
+                    source: Some("error".to_string()),
+                    message: Some(if message.is_empty() {
+                        "读取 macOS 系统代理失败。".to_string()
+                    } else {
+                        message
+                    }),
+                }
+            }
+            Err(error) => ProxyStatus {
+                mode: ProxyMode::Auto.as_str().to_string(),
+                effective_proxy: None,
+                source: Some("error".to_string()),
+                message: Some(error),
+            },
+        };
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        ProxyStatus {
+            mode: ProxyMode::Auto.as_str().to_string(),
+            effective_proxy: None,
+            source: Some("unsupported".to_string()),
+            message: Some("自动读取系统代理目前仅支持 macOS。".to_string()),
+        }
+    }
+}
+
+fn proxy_status_from_scutil_output(output: &str) -> ProxyStatus {
+    let entries = parse_scutil_proxy_entries(output);
+
+    if let Some(proxy) = scutil_proxy_url(&entries, "HTTPS", "http") {
+        return ProxyStatus {
+            mode: ProxyMode::Auto.as_str().to_string(),
+            effective_proxy: Some(proxy),
+            source: Some("systemHttps".to_string()),
+            message: Some("自动读取 HTTPS 系统代理".to_string()),
+        };
+    }
+
+    if let Some(proxy) = scutil_proxy_url(&entries, "HTTP", "http") {
+        return ProxyStatus {
+            mode: ProxyMode::Auto.as_str().to_string(),
+            effective_proxy: Some(proxy),
+            source: Some("systemHttp".to_string()),
+            message: Some("自动读取 HTTP 系统代理".to_string()),
+        };
+    }
+
+    if let Some(proxy) = scutil_proxy_url(&entries, "SOCKS", "socks5h") {
+        return ProxyStatus {
+            mode: ProxyMode::Auto.as_str().to_string(),
+            effective_proxy: Some(proxy),
+            source: Some("systemSocks".to_string()),
+            message: Some("自动读取 SOCKS 系统代理".to_string()),
+        };
+    }
+
+    if scutil_enabled(&entries, "ProxyAutoConfigEnable") {
+        return ProxyStatus {
+            mode: ProxyMode::Auto.as_str().to_string(),
+            effective_proxy: None,
+            source: Some("pacUnsupported".to_string()),
+            message: Some("检测到自动代理脚本（PAC），暂不支持解析，未传入代理。".to_string()),
+        };
+    }
+
+    ProxyStatus {
+        mode: ProxyMode::Auto.as_str().to_string(),
+        effective_proxy: None,
+        source: Some("none".to_string()),
+        message: Some("未检测到系统代理".to_string()),
+    }
+}
+
+fn parse_scutil_proxy_entries(output: &str) -> HashMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+
+            Some((
+                key.to_string(),
+                value
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn scutil_enabled(entries: &HashMap<String, String>, key: &str) -> bool {
+    entries
+        .get(key)
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            value == "1" || value == "yes" || value == "true"
+        })
+        .unwrap_or(false)
+}
+
+fn scutil_proxy_url(
+    entries: &HashMap<String, String>,
+    prefix: &str,
+    scheme: &str,
+) -> Option<String> {
+    if !scutil_enabled(entries, &format!("{prefix}Enable")) {
+        return None;
+    }
+
+    let host = entries.get(&format!("{prefix}Proxy"))?.trim();
+    let port = entries
+        .get(&format!("{prefix}Port"))?
+        .trim()
+        .parse::<u16>()
+        .ok()?;
+
+    if host.is_empty() || port == 0 {
+        return None;
+    }
+
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+
+    Some(format!("{scheme}://{host}:{port}"))
+}
+
 fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut deduped = Vec::new();
 
@@ -2156,13 +2599,157 @@ fn run_command_with_timeout_named(
         if started_at.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
+            let hint = if label == "yt-dlp" {
+                "，请检查网络或代理"
+            } else {
+                ""
+            };
             return Err(format!(
-                "{label} 超过 {} 秒未返回，请检查网络或代理。",
-                timeout.as_secs()
+                "{label} 超过 {} 秒未返回{hint}。",
+                timeout.as_secs(),
             ));
         }
 
         thread::sleep(Duration::from_millis(120));
+    }
+}
+
+fn run_ytdlp_command_with_timeout(
+    state: &AppState,
+    mut command: Command,
+    timeout: Duration,
+    operation_id: Option<&str>,
+) -> Result<Output, String> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("无法启动 yt-dlp：{error}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法读取 yt-dlp 输出。".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "无法读取 yt-dlp 错误输出。".to_string())?;
+    let stdout_handle = thread::spawn(move || read_stream_to_end(stdout));
+    let stderr_handle = thread::spawn(move || read_stream_to_end(stderr));
+    let child = Arc::new(Mutex::new(child));
+    let canceled = Arc::new(AtomicBool::new(false));
+    let operation_key = operation_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    if let Some(operation_key) = operation_key.as_deref() {
+        register_ytdlp_operation(
+            state,
+            operation_key,
+            Arc::clone(&child),
+            Arc::clone(&canceled),
+        )?;
+    }
+
+    let started_at = Instant::now();
+    loop {
+        if canceled.load(Ordering::SeqCst) {
+            terminate_ytdlp_child(&child);
+            cleanup_ytdlp_operation(state, operation_key.as_deref());
+            let _ = join_stream_handle(stdout_handle, "yt-dlp stdout");
+            let _ = join_stream_handle(stderr_handle, "yt-dlp stderr");
+            return Err(YTDLP_OPERATION_CANCELED_MESSAGE.to_string());
+        }
+
+        let status = {
+            let mut child = child
+                .lock()
+                .map_err(|_| "yt-dlp 子进程锁已损坏。".to_string())?;
+            child
+                .try_wait()
+                .map_err(|error| format!("等待 yt-dlp 失败：{error}"))?
+        };
+
+        if let Some(status) = status {
+            cleanup_ytdlp_operation(state, operation_key.as_deref());
+            let stdout = join_stream_handle(stdout_handle, "yt-dlp stdout")?;
+            let stderr = join_stream_handle(stderr_handle, "yt-dlp stderr")?;
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+
+        if started_at.elapsed() >= timeout {
+            terminate_ytdlp_child(&child);
+            cleanup_ytdlp_operation(state, operation_key.as_deref());
+            let _ = join_stream_handle(stdout_handle, "yt-dlp stdout");
+            let _ = join_stream_handle(stderr_handle, "yt-dlp stderr");
+            return Err(format!(
+                "yt-dlp 超过 {} 秒未返回，请检查网络或代理。",
+                timeout.as_secs(),
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(120));
+    }
+}
+
+fn read_stream_to_end<R: Read>(mut reader: R) -> Vec<u8> {
+    let mut output = Vec::new();
+    let _ = reader.read_to_end(&mut output);
+    output
+}
+
+fn join_stream_handle(handle: thread::JoinHandle<Vec<u8>>, label: &str) -> Result<Vec<u8>, String> {
+    handle
+        .join()
+        .map_err(|_| format!("读取 {label} 输出线程失败。"))
+}
+
+fn register_ytdlp_operation(
+    state: &AppState,
+    operation_id: &str,
+    child: Arc<Mutex<Child>>,
+    canceled: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let previous = {
+        let mut operations = state
+            .ytdlp_operations
+            .lock()
+            .map_err(|_| "yt-dlp 操作状态锁已损坏。".to_string())?;
+        operations.insert(
+            operation_id.to_string(),
+            YtdlpOperationControl { child, canceled },
+        )
+    };
+
+    if let Some(previous) = previous {
+        previous.canceled.store(true, Ordering::SeqCst);
+        if let Ok(mut child) = previous.child.lock() {
+            let _ = child.kill();
+        }
+    }
+
+    Ok(())
+}
+
+fn cleanup_ytdlp_operation(state: &AppState, operation_id: Option<&str>) {
+    let Some(operation_id) = operation_id else {
+        return;
+    };
+
+    if let Ok(mut operations) = state.ytdlp_operations.lock() {
+        operations.remove(operation_id);
+    }
+}
+
+fn terminate_ytdlp_child(child: &Arc<Mutex<Child>>) {
+    if let Ok(mut child) = child.lock() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -2198,6 +2785,221 @@ fn thumbnail_url(json: &Value) -> Option<String> {
                 .and_then(|thumbnails| thumbnails.iter().find_map(|item| string_field(item, "url")))
         })
         .map(normalize_thumbnail_url)
+}
+
+fn probe_local_media(state: &AppState, ffmpeg_path: &Path, media_path: &Path) -> LocalMediaInfo {
+    let probed_at = Some(unix_timestamp());
+
+    if !media_path.is_file() {
+        return LocalMediaInfo {
+            probed_at,
+            error: Some(format!("本地媒体文件不存在：{}", media_path.display())),
+            ..Default::default()
+        };
+    }
+
+    let mut command = Command::new(ffprobe_path_from_ffmpeg(ffmpeg_path));
+    apply_tool_env(state, &mut command);
+    command
+        .arg("-v")
+        .arg("error")
+        .arg("-print_format")
+        .arg("json")
+        .arg("-show_format")
+        .arg("-show_streams")
+        .arg(media_path);
+
+    let output = match run_command_with_timeout_named(command, Duration::from_secs(20), "ffprobe") {
+        Ok(output) => output,
+        Err(error) => {
+            return LocalMediaInfo {
+                probed_at,
+                error: Some(error),
+                ..Default::default()
+            };
+        }
+    };
+
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return LocalMediaInfo {
+            probed_at,
+            error: Some(if message.is_empty() {
+                "ffprobe 未返回可用媒体信息。".to_string()
+            } else {
+                message
+            }),
+            ..Default::default()
+        };
+    }
+
+    let json = match serde_json::from_slice::<Value>(&output.stdout) {
+        Ok(json) => json,
+        Err(error) => {
+            return LocalMediaInfo {
+                probed_at,
+                error: Some(format!("解析 ffprobe JSON 失败：{error}")),
+                ..Default::default()
+            };
+        }
+    };
+
+    parse_local_media_info(&json, probed_at)
+}
+
+fn ffprobe_path_from_ffmpeg(ffmpeg_path: &Path) -> PathBuf {
+    let executable_name = if cfg!(target_os = "windows") {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    };
+
+    if let Some(parent) = ffmpeg_path.parent() {
+        let candidate = parent.join(executable_name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
+    PathBuf::from(executable_name)
+}
+
+fn parse_local_media_info(json: &Value, probed_at: Option<String>) -> LocalMediaInfo {
+    let streams = json
+        .get("streams")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let video_stream = streams
+        .iter()
+        .find(|stream| string_field(stream, "codec_type").as_deref() == Some("video"));
+    let audio_stream = streams
+        .iter()
+        .find(|stream| string_field(stream, "codec_type").as_deref() == Some("audio"));
+    let duration = json
+        .get("format")
+        .and_then(|format| number_field(format, "duration"))
+        .or_else(|| {
+            streams
+                .iter()
+                .filter_map(|stream| number_field(stream, "duration"))
+                .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+    LocalMediaInfo {
+        duration,
+        width: video_stream.and_then(|stream| u64_field(stream, "width")),
+        height: video_stream.and_then(|stream| u64_field(stream, "height")),
+        video_codec: video_stream.and_then(|stream| codec_field(stream, "codec_name")),
+        audio_codec: audio_stream.and_then(|stream| codec_field(stream, "codec_name")),
+        probed_at,
+        error: None,
+    }
+}
+
+fn compare_media(
+    expected: Option<&ExpectedMediaInfo>,
+    actual: &LocalMediaInfo,
+) -> Option<MediaComparison> {
+    let expected = expected?;
+    let duration = compare_duration(expected.duration, actual.duration);
+    let resolution = compare_resolution(
+        expected.resolution_label.as_deref(),
+        expected.resolution_score,
+        actual.width,
+        actual.height,
+    );
+
+    if duration.is_none() && resolution.is_none() {
+        None
+    } else {
+        Some(MediaComparison {
+            duration,
+            resolution,
+        })
+    }
+}
+
+fn compare_duration(expected: Option<f64>, actual: Option<f64>) -> Option<MediaComparisonDetail> {
+    let expected = expected.filter(|value| value.is_finite() && *value > 0.0)?;
+    let actual = actual.filter(|value| value.is_finite() && *value > 0.0)?;
+    let tolerance = (expected * 0.02).max(5.0);
+    let delta = actual - expected;
+
+    if delta.abs() <= tolerance {
+        return None;
+    }
+
+    Some(MediaComparisonDetail {
+        status: if delta < 0.0 { "shorter" } else { "longer" }.to_string(),
+        expected_label: Some(format_media_duration(expected)),
+        actual_label: Some(format_media_duration(actual)),
+    })
+}
+
+fn compare_resolution(
+    expected_label: Option<&str>,
+    expected_score: Option<u64>,
+    actual_width: Option<u64>,
+    actual_height: Option<u64>,
+) -> Option<MediaComparisonDetail> {
+    let expected_score = expected_score.filter(|score| *score > 0)?;
+    let (actual_width, actual_height) = actual_width.zip(actual_height)?;
+    if actual_width == 0 || actual_height == 0 {
+        return None;
+    }
+
+    let actual_score = actual_width.saturating_mul(actual_height);
+    if actual_score == expected_score {
+        return None;
+    }
+
+    Some(MediaComparisonDetail {
+        status: if actual_score < expected_score {
+            "lower"
+        } else {
+            "higher"
+        }
+        .to_string(),
+        expected_label: expected_label
+            .and_then(clean_text)
+            .or_else(|| Some(format!("{expected_score} px"))),
+        actual_label: Some(format!("{actual_width}×{actual_height}")),
+    })
+}
+
+fn format_media_duration(duration: f64) -> String {
+    let total_seconds = duration.max(0.0).round() as u64;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+fn number_field(json: &Value, key: &str) -> Option<f64> {
+    match json.get(key)? {
+        Value::Number(value) => value.as_f64(),
+        Value::String(value) => value.parse::<f64>().ok(),
+        _ => None,
+    }
+    .filter(|value| value.is_finite())
+}
+
+fn u64_field(json: &Value, key: &str) -> Option<u64> {
+    match json.get(key)? {
+        Value::Number(value) => value.as_u64(),
+        Value::String(value) => value.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn codec_field(json: &Value, key: &str) -> Option<String> {
+    string_field(json, key).filter(|value| !value.eq_ignore_ascii_case("none"))
 }
 
 fn normalize_thumbnail_url(url: String) -> String {
@@ -2241,22 +3043,63 @@ fn build_format_options(json: &Value) -> Vec<FormatOption> {
     ];
 
     if let Some(formats) = json.get("formats").and_then(Value::as_array) {
-        let mut video_formats: Vec<FormatOption> = formats
+        let mut video_formats: Vec<&Value> = formats
             .iter()
-            .filter_map(format_from_json)
-            .filter(|format| format.vcodec.as_deref() != Some("none"))
+            .filter(|format| has_real_video(format))
             .collect();
 
         video_formats.sort_by(|left, right| {
-            let left_score = resolution_score(left.resolution.as_deref());
-            let right_score = resolution_score(right.resolution.as_deref());
+            let left_score = format_score(left);
+            let right_score = format_score(right);
             right_score.cmp(&left_score)
         });
 
-        options.extend(video_formats.into_iter().take(12));
+        options.extend(
+            video_formats
+                .into_iter()
+                .filter_map(format_from_json)
+                .take(12),
+        );
     }
 
     options
+}
+
+fn best_format_label_from_json(json: &Value, formats: &[FormatOption]) -> Option<String> {
+    if let Some(label) = json
+        .get("requested_formats")
+        .and_then(Value::as_array)
+        .and_then(|requested| {
+            requested
+                .iter()
+                .find(|format| has_real_video(format))
+                .and_then(format_label_from_json)
+        })
+    {
+        return Some(label);
+    }
+
+    if has_real_video(json) {
+        if let Some(label) = format_label_from_json(json) {
+            return Some(label);
+        }
+    }
+
+    if let Some(label) = json
+        .get("formats")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .filter(|format| has_real_video(format))
+                .max_by_key(|format| format_score(format))
+                .and_then(format_label_from_json)
+        })
+    {
+        return Some(label);
+    }
+
+    best_format_label(formats)
 }
 
 fn best_format_label(formats: &[FormatOption]) -> Option<String> {
@@ -2272,14 +3115,7 @@ fn best_format_label(formats: &[FormatOption]) -> Option<String> {
 fn format_from_json(format: &Value) -> Option<FormatOption> {
     let id = string_field(format, "format_id")?;
     let ext = string_field(format, "ext");
-    let resolution = string_field(format, "resolution")
-        .or_else(|| string_field(format, "format_note"))
-        .or_else(|| {
-            format
-                .get("height")
-                .and_then(Value::as_u64)
-                .map(|height| format!("{height}p"))
-        });
+    let resolution = actual_resolution_label(format);
     let vcodec = string_field(format, "vcodec");
     let acodec = string_field(format, "acodec");
     let filesize = format
@@ -2287,12 +3123,19 @@ fn format_from_json(format: &Value) -> Option<FormatOption> {
         .or_else(|| format.get("filesize_approx"))
         .and_then(Value::as_u64);
 
-    let label = [resolution.clone(), ext.clone(), vcodec.clone()]
-        .into_iter()
-        .flatten()
-        .filter(|value| !value.eq_ignore_ascii_case("none"))
-        .collect::<Vec<_>>()
-        .join(" · ");
+    let display_resolution = resolution
+        .clone()
+        .unwrap_or_else(|| "未返回明确分辨率".to_string());
+    let label = [
+        Some(display_resolution),
+        ext.clone(),
+        display_video_codec(vcodec.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|value| !value.eq_ignore_ascii_case("none"))
+    .collect::<Vec<_>>()
+    .join(" · ");
 
     Some(FormatOption {
         selector: format!("{id}+ba/b"),
@@ -2310,13 +3153,203 @@ fn format_from_json(format: &Value) -> Option<FormatOption> {
     })
 }
 
-fn resolution_score(resolution: Option<&str>) -> u64 {
-    let Some(resolution) = resolution else {
-        return 0;
-    };
+fn format_label_from_json(format: &Value) -> Option<String> {
+    let display_resolution =
+        actual_resolution_label(format).unwrap_or_else(|| "未返回明确分辨率".to_string());
+    let vcodec = codec_field(format, "vcodec");
+    let parts = [
+        Some(display_resolution),
+        string_field(format, "ext"),
+        display_video_codec(vcodec.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|value| !value.trim().is_empty())
+    .collect::<Vec<_>>();
 
-    let digits: String = resolution.chars().filter(char::is_ascii_digit).collect();
-    digits.parse().unwrap_or(0)
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
+fn display_video_codec(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("av01") {
+        return Some("AV1".to_string());
+    }
+    if lower.starts_with("avc1") || lower.starts_with("avc3") || lower == "h264" {
+        return Some("H.264".to_string());
+    }
+    if lower.starts_with("hev1") || lower.starts_with("hvc1") || lower == "hevc" || lower == "h265"
+    {
+        return Some("H.265".to_string());
+    }
+    if lower.starts_with("vp09") || lower == "vp9" {
+        return Some("VP9".to_string());
+    }
+    if lower.starts_with("vp08") || lower == "vp8" {
+        return Some("VP8".to_string());
+    }
+
+    if value.contains('.') {
+        if let Some(prefix) = value.split('.').next().filter(|prefix| !prefix.is_empty()) {
+            return Some(prefix.to_ascii_uppercase());
+        }
+    }
+
+    Some(value.to_string())
+}
+
+fn has_real_video(format: &Value) -> bool {
+    codec_field(format, "vcodec").is_some()
+}
+
+fn actual_resolution_label(format: &Value) -> Option<String> {
+    if let Some((width, height)) = u64_field(format, "width").zip(u64_field(format, "height")) {
+        if width > 0 && height > 0 {
+            return Some(format!("{width}x{height}"));
+        }
+    }
+
+    string_field(format, "resolution").and_then(|value| {
+        parse_dimension_score(&value).map(|(width, height, _)| format!("{width}x{height}"))
+    })
+}
+
+fn format_score(format: &Value) -> u64 {
+    if let Some((width, height)) = u64_field(format, "width").zip(u64_field(format, "height")) {
+        if width > 0 && height > 0 {
+            return width.saturating_mul(height);
+        }
+    }
+
+    [
+        string_field(format, "resolution"),
+        string_field(format, "format_note"),
+        u64_field(format, "height").map(|height| format!("{height}p")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| resolution_score_from_text(&value))
+    .max()
+    .unwrap_or(0)
+}
+
+fn resolution_score_from_text(value: &str) -> Option<u64> {
+    if let Some((_, _, score)) = parse_dimension_score(value) {
+        return Some(score);
+    }
+
+    if let Some(height) = parse_progressive_height(value) {
+        let width = height.saturating_mul(16) / 9;
+        return Some(width.saturating_mul(height));
+    }
+
+    let text = value.to_ascii_lowercase();
+    if contains_quality_token(&text, "8k") {
+        return Some(7680 * 4320);
+    }
+    if contains_quality_token(&text, "4k") || text.contains("uhd") {
+        return Some(3840 * 2160);
+    }
+    if contains_quality_token(&text, "2k") || text.contains("qhd") {
+        return Some(2560 * 1440);
+    }
+
+    None
+}
+
+fn parse_dimension_score(value: &str) -> Option<(u64, u64, u64)> {
+    let chars = value.chars().collect::<Vec<_>>();
+    for (index, character) in chars.iter().enumerate() {
+        if !matches!(character, 'x' | 'X' | '×') {
+            continue;
+        }
+
+        let mut left_end = index;
+        while left_end > 0 && chars[left_end - 1].is_whitespace() {
+            left_end -= 1;
+        }
+        let mut left_start = left_end;
+        while left_start > 0 && chars[left_start - 1].is_ascii_digit() {
+            left_start -= 1;
+        }
+
+        let mut right_start = index + 1;
+        while right_start < chars.len() && chars[right_start].is_whitespace() {
+            right_start += 1;
+        }
+        let mut right_end = right_start;
+        while right_end < chars.len() && chars[right_end].is_ascii_digit() {
+            right_end += 1;
+        }
+
+        if left_start == left_end || right_start == right_end {
+            continue;
+        }
+
+        let width = chars[left_start..left_end]
+            .iter()
+            .collect::<String>()
+            .parse::<u64>()
+            .ok()?;
+        let height = chars[right_start..right_end]
+            .iter()
+            .collect::<String>()
+            .parse::<u64>()
+            .ok()?;
+
+        if width > 0 && height > 0 {
+            return Some((width, height, width.saturating_mul(height)));
+        }
+    }
+
+    None
+}
+
+fn parse_progressive_height(value: &str) -> Option<u64> {
+    let chars = value.chars().collect::<Vec<_>>();
+    for (index, character) in chars.iter().enumerate() {
+        if !matches!(character, 'p' | 'P') {
+            continue;
+        }
+
+        let mut end = index;
+        while end > 0 && chars[end - 1].is_whitespace() {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > 0 && chars[start - 1].is_ascii_digit() {
+            start -= 1;
+        }
+
+        if start == end {
+            continue;
+        }
+
+        let height = chars[start..end]
+            .iter()
+            .collect::<String>()
+            .parse::<u64>()
+            .ok()?;
+        if height > 0 {
+            return Some(height);
+        }
+    }
+
+    None
+}
+
+fn contains_quality_token(text: &str, token: &str) -> bool {
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| part == token)
 }
 
 fn update_progress_snapshot(
@@ -2669,7 +3702,7 @@ mod tests {
             },
             FormatOption {
                 id: "30121".to_string(),
-                label: "3840x1634 · mp4 · hev1.1.6.L153".to_string(),
+                label: "3840x1634 · mp4 · H.265".to_string(),
                 selector: "30121+bestaudio/best".to_string(),
                 ext: Some("mp4".to_string()),
                 resolution: Some("3840x1634".to_string()),
@@ -2681,7 +3714,324 @@ mod tests {
 
         assert_eq!(
             best_format_label(&formats).as_deref(),
-            Some("3840x1634 · mp4 · hev1.1.6.L153")
+            Some("3840x1634 · mp4 · H.265")
+        );
+    }
+
+    #[test]
+    fn format_labels_use_short_video_codec_names() {
+        let cases = [
+            ("av01.0.00M.10.0.110.01.01.01.0", "AV1"),
+            ("avc1.640034", "H.264"),
+            ("h264", "H.264"),
+            ("hev1.1.6.L153", "H.265"),
+            ("hvc1.2.4.L150", "H.265"),
+            ("vp09.00.51.08", "VP9"),
+            ("vp08.00.10.08", "VP8"),
+            ("mystery.codec.profile", "MYSTERY"),
+            ("theora", "theora"),
+        ];
+
+        for (vcodec, expected_codec) in cases {
+            let format = serde_json::json!({
+                "format_id": "test",
+                "width": 1920,
+                "height": 1080,
+                "ext": "mp4",
+                "vcodec": vcodec,
+                "acodec": "none"
+            });
+            let expected_label = format!("1920x1080 · mp4 · {expected_codec}");
+
+            assert_eq!(
+                format_label_from_json(&format).as_deref(),
+                Some(expected_label.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn format_option_keeps_raw_codec_but_displays_short_name() {
+        let format = serde_json::json!({
+            "format_id": "30121",
+            "width": 3840,
+            "height": 1634,
+            "ext": "mp4",
+            "vcodec": "av01.0.00M.10.0.110.01.01.01.0",
+            "acodec": "none"
+        });
+
+        let option = format_from_json(&format).expect("format option");
+
+        assert_eq!(
+            option.vcodec.as_deref(),
+            Some("av01.0.00M.10.0.110.01.01.01.0")
+        );
+        assert_eq!(option.label, "3840x1634 · mp4 · AV1");
+    }
+
+    #[test]
+    fn format_label_prefers_raw_width_and_height() {
+        let format = serde_json::json!({
+            "format_id": "30121",
+            "width": 3840,
+            "height": 2160,
+            "format_note": "4K",
+            "ext": "mp4",
+            "vcodec": "avc1.640034",
+            "acodec": "none"
+        });
+
+        assert_eq!(
+            actual_resolution_label(&format).as_deref(),
+            Some("3840x2160")
+        );
+        assert_eq!(format_score(&format), 3840 * 2160);
+        assert_eq!(
+            format_label_from_json(&format).as_deref(),
+            Some("3840x2160 · mp4 · H.264")
+        );
+    }
+
+    #[test]
+    fn fallback_resolution_scores_do_not_become_display_labels() {
+        let format = serde_json::json!({
+            "format_id": "137",
+            "height": 2160,
+            "format_note": "4K",
+            "ext": "mp4",
+            "vcodec": "h264",
+            "acodec": "none"
+        });
+
+        assert_eq!(actual_resolution_label(&format), None);
+        assert_eq!(format_score(&format), 3840 * 2160);
+        assert_eq!(
+            format_label_from_json(&format).as_deref(),
+            Some("未返回明确分辨率 · mp4 · H.264")
+        );
+    }
+
+    #[test]
+    fn best_format_label_uses_requested_video_format() {
+        let json = serde_json::json!({
+            "requested_formats": [
+                {
+                    "format_id": "30121",
+                    "width": 3840,
+                    "height": 2160,
+                    "format_note": "4K",
+                    "ext": "mp4",
+                    "vcodec": "avc1.640034",
+                    "acodec": "none"
+                },
+                {
+                    "format_id": "30280",
+                    "ext": "m4a",
+                    "vcodec": "none",
+                    "acodec": "mp4a.40.2"
+                }
+            ],
+            "formats": [
+                {
+                    "format_id": "low",
+                    "width": 1280,
+                    "height": 720,
+                    "ext": "mp4",
+                    "vcodec": "h264",
+                    "acodec": "none"
+                }
+            ]
+        });
+        let formats = build_format_options(&json);
+
+        assert_eq!(
+            best_format_label_from_json(&json, &formats).as_deref(),
+            Some("3840x2160 · mp4 · H.264")
+        );
+    }
+
+    #[test]
+    fn parses_macos_proxy_output_by_priority() {
+        let output = r#"
+<dictionary> {
+  HTTPEnable : 1
+  HTTPPort : 7890
+  HTTPProxy : 127.0.0.1
+  HTTPSEnable : 1
+  HTTPSPort : 7891
+  HTTPSProxy : 127.0.0.2
+  SOCKSEnable : 1
+  SOCKSPort : 7892
+  SOCKSProxy : 127.0.0.3
+}
+"#;
+
+        let status = proxy_status_from_scutil_output(output);
+
+        assert_eq!(status.mode, "auto");
+        assert_eq!(
+            status.effective_proxy.as_deref(),
+            Some("http://127.0.0.2:7891")
+        );
+        assert_eq!(status.source.as_deref(), Some("systemHttps"));
+    }
+
+    #[test]
+    fn parses_macos_socks_proxy_when_http_is_absent() {
+        let output = r#"
+<dictionary> {
+  SOCKSEnable : 1
+  SOCKSPort : 1080
+  SOCKSProxy : 127.0.0.1
+}
+"#;
+
+        let status = proxy_status_from_scutil_output(output);
+
+        assert_eq!(
+            status.effective_proxy.as_deref(),
+            Some("socks5h://127.0.0.1:1080")
+        );
+        assert_eq!(status.source.as_deref(), Some("systemSocks"));
+    }
+
+    #[test]
+    fn reports_pac_as_unsupported_without_proxy() {
+        let output = r#"
+<dictionary> {
+  ProxyAutoConfigEnable : 1
+  ProxyAutoConfigURLString : http://example.test/proxy.pac
+}
+"#;
+
+        let status = proxy_status_from_scutil_output(output);
+
+        assert_eq!(status.effective_proxy, None);
+        assert_eq!(status.source.as_deref(), Some("pacUnsupported"));
+    }
+
+    #[test]
+    fn parses_ffprobe_media_info_from_format_and_streams() {
+        let json = serde_json::json!({
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "h264",
+                    "width": 1920,
+                    "height": 1080,
+                    "duration": "480.1"
+                },
+                {
+                    "codec_type": "audio",
+                    "codec_name": "aac",
+                    "duration": "481.2"
+                }
+            ],
+            "format": {
+                "duration": "481.2"
+            }
+        });
+
+        let media = parse_local_media_info(&json, Some("123".to_string()));
+
+        assert_eq!(media.duration, Some(481.2));
+        assert_eq!(media.width, Some(1920));
+        assert_eq!(media.height, Some(1080));
+        assert_eq!(media.video_codec.as_deref(), Some("h264"));
+        assert_eq!(media.audio_codec.as_deref(), Some("aac"));
+        assert_eq!(media.probed_at.as_deref(), Some("123"));
+        assert_eq!(media.error, None);
+    }
+
+    #[test]
+    fn parses_ffprobe_duration_from_streams_when_format_duration_is_missing() {
+        let json = serde_json::json!({
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "hevc",
+                    "width": "1280",
+                    "height": "720",
+                    "duration": "300.5"
+                },
+                {
+                    "codec_type": "audio",
+                    "codec_name": "opus",
+                    "duration": "302.0"
+                }
+            ]
+        });
+
+        let media = parse_local_media_info(&json, None);
+
+        assert_eq!(media.duration, Some(302.0));
+        assert_eq!(media.width, Some(1280));
+        assert_eq!(media.height, Some(720));
+        assert_eq!(media.video_codec.as_deref(), Some("hevc"));
+        assert_eq!(media.audio_codec.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn compare_media_omits_matching_expected_values() {
+        let expected = ExpectedMediaInfo {
+            duration: Some(480.0),
+            resolution_label: Some("1080p".to_string()),
+            resolution_score: Some(1920 * 1080),
+        };
+        let actual = LocalMediaInfo {
+            duration: Some(482.0),
+            width: Some(1920),
+            height: Some(1080),
+            ..Default::default()
+        };
+
+        assert!(compare_media(Some(&expected), &actual).is_none());
+    }
+
+    #[test]
+    fn compare_media_reports_shorter_duration_and_lower_resolution() {
+        let expected = ExpectedMediaInfo {
+            duration: Some(600.0),
+            resolution_label: Some("1080p".to_string()),
+            resolution_score: Some(1920 * 1080),
+        };
+        let actual = LocalMediaInfo {
+            duration: Some(500.0),
+            width: Some(1280),
+            height: Some(720),
+            ..Default::default()
+        };
+
+        let comparison = compare_media(Some(&expected), &actual).unwrap();
+
+        assert_eq!(
+            comparison
+                .duration
+                .as_ref()
+                .map(|detail| detail.status.as_str()),
+            Some("shorter")
+        );
+        assert_eq!(
+            comparison
+                .resolution
+                .as_ref()
+                .map(|detail| detail.status.as_str()),
+            Some("lower")
+        );
+        assert_eq!(
+            comparison
+                .resolution
+                .as_ref()
+                .and_then(|detail| detail.expected_label.as_deref()),
+            Some("1080p")
+        );
+        assert_eq!(
+            comparison
+                .resolution
+                .as_ref()
+                .and_then(|detail| detail.actual_label.as_deref()),
+            Some("1280×720")
         );
     }
 }
@@ -2957,6 +4307,8 @@ fn update_history_status(
     status: &str,
     progress: f64,
     output_path: Option<String>,
+    local_media: Option<LocalMediaInfo>,
+    media_comparison: Option<MediaComparison>,
     error: Option<String>,
 ) -> Result<(), String> {
     let _guard = state
@@ -2969,6 +4321,8 @@ fn update_history_status(
         existing.status = status.to_string();
         existing.progress = progress;
         existing.output_path = output_path.clone();
+        existing.local_media = local_media;
+        existing.media_comparison = media_comparison;
         existing.error = error;
         let title_is_replaceable = is_placeholder_text(&existing.title)
             || (output_path

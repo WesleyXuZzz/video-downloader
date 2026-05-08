@@ -782,6 +782,10 @@ body {
   color: #475569;
 }
 
+.auth-probe-status-trigger.is-canceled.ant-btn {
+  color: #64748b;
+}
+
 .auth-probe-status-trigger.is-checking.ant-btn {
   color: #0958d9;
 }
@@ -835,10 +839,14 @@ body {
   background: #94a3b8;
 }
 
+.auth-probe-status-trigger.is-canceled .auth-probe-dot {
+  background: #94a3b8;
+}
+
 .auth-probe-popover {
   display: grid;
-  gap: 8px;
-  width: min(360px, calc(100vw - 48px));
+  gap: 12px;
+  width: min(520px, calc(100vw - 48px));
 }
 
 .auth-probe-popover-head {
@@ -848,18 +856,239 @@ body {
   gap: 12px;
 }
 
-.auth-probe-status,
-.auth-probe-details,
+.auth-probe-summary {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.auth-probe-summary-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  background: #94a3b8;
+  border-radius: 999px;
+}
+
+.auth-probe-summary.is-checking .auth-probe-summary-dot {
+  background: #1677ff;
+}
+
+.auth-probe-summary.is-ready .auth-probe-summary-dot {
+  background: #52c41a;
+}
+
+.auth-probe-summary.is-warning .auth-probe-summary-dot {
+  background: #faad14;
+}
+
+.auth-probe-summary.is-failed .auth-probe-summary-dot {
+  background: #ff4d4f;
+}
+
+.auth-probe-summary.is-unavailable .auth-probe-summary-dot {
+  background: #94a3b8;
+}
+
+.auth-probe-summary.is-canceled .auth-probe-summary-dot {
+  background: #94a3b8;
+}
+
+.auth-probe-summary-pill {
+  display: inline-flex;
+  height: 23px;
+  align-items: center;
+  padding: 0 9px;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  color: #475569;
+  background: #f8fafc;
+  font-size: 12px;
+  font-weight: 680;
+  line-height: 21px;
+}
+
+.auth-probe-summary-pill.is-ready {
+  color: #237804;
+  background: #f6ffed;
+  border-color: #b7eb8f;
+}
+
+.auth-probe-summary-pill.is-warning {
+  color: #8a5a00;
+  background: #fff7e6;
+  border-color: #ffd591;
+}
+
+.auth-probe-summary-pill.is-checking {
+  color: #0958d9;
+  background: #e6f4ff;
+  border-color: #91caff;
+}
+
+.auth-probe-summary-pill.is-failed,
+.auth-probe-summary-pill.is-unavailable {
+  color: #a8071a;
+  background: #fff1f0;
+  border-color: #ffa39e;
+}
+
+.auth-probe-summary-pill.is-canceled {
+  color: #475569;
+  background: #f8fafc;
+  border-color: #e2e8f0;
+}
+
+.auth-probe-summary-meta {
+  overflow: hidden;
+  min-width: 0;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auth-probe-site-list {
+  display: grid;
+  gap: 6px;
+}
+
+.auth-probe-site-row {
+  display: grid;
+  grid-template-columns: minmax(128px, 0.72fr) minmax(0, 1.28fr);
+  gap: 12px;
+  align-items: center;
+  min-width: 0;
+  padding: 8px 10px;
+  background: #ffffff;
+  border: 1px solid #edf2f7;
+  border-radius: 8px;
+}
+
+.auth-probe-site-row.is-highest {
+  background: #f4f8ff;
+  border-color: #bfdbfe;
+  box-shadow: inset 3px 0 0 var(--primary);
+}
+
+.auth-probe-site-main {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.auth-probe-site-name {
+  overflow: hidden;
+  min-width: 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 680;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auth-probe-highest-pill,
+.auth-probe-site-count {
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 21px;
+  align-items: center;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 680;
+  line-height: 19px;
+}
+
+.auth-probe-highest-pill {
+  color: #0958d9;
+  background: #e6f4ff;
+  border: 1px solid #91caff;
+}
+
+.auth-probe-site-count {
+  color: #475569;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+
+.auth-probe-site-count.is-ready {
+  color: #237804;
+  background: #f6ffed;
+  border-color: #b7eb8f;
+}
+
+.auth-probe-site-count.is-warning {
+  color: #8a5a00;
+  background: #fff7e6;
+  border-color: #ffd591;
+}
+
+.auth-probe-site-count.is-checking {
+  color: #0958d9;
+  background: #e6f4ff;
+  border-color: #91caff;
+}
+
+.auth-probe-site-count.is-failed,
+.auth-probe-site-count.is-unavailable {
+  color: #a8071a;
+  background: #fff1f0;
+  border-color: #ffa39e;
+}
+
+.auth-probe-site-count.is-canceled {
+  color: #475569;
+  background: #f8fafc;
+  border-color: #e2e8f0;
+}
+
+.auth-probe-site-format {
+  display: flex;
+  min-width: 0;
+  justify-content: flex-end;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.auth-probe-format {
+  display: inline-flex;
+  max-width: 100%;
+  min-width: 0;
+  align-items: center;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.auth-probe-format-resolution {
+  flex: 0 0 auto;
+  color: var(--primary);
+  font-weight: 760;
+}
+
+.auth-probe-format-detail,
+.auth-probe-site-message {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+}
+
+.auth-probe-message.ant-typography,
 .auth-probe-hint {
   overflow: hidden;
   font-size: 12px;
   line-height: 1.35;
 }
 
-.auth-probe-status.ant-typography,
-.auth-probe-details.ant-typography {
+.auth-probe-message.ant-typography {
   display: block;
-  white-space: pre-line;
+  overflow-wrap: anywhere;
 }
 
 .auth-probe-hint.ant-typography {
@@ -880,6 +1109,10 @@ body {
 
 .auth-probe-popover.is-unavailable .auth-probe-hint.ant-typography {
   color: #475569;
+}
+
+.auth-probe-popover.is-canceled .auth-probe-hint.ant-typography {
+  color: #64748b;
 }
 
 .download-workbench {
@@ -1101,6 +1334,26 @@ body {
 
 .download-options-grid {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: start;
+}
+
+.download-options-grid .field-block {
+  display: grid;
+  grid-template-rows: 24px 40px;
+  gap: 6px;
+}
+
+.download-options-grid .field-block > .ant-typography,
+.download-options-grid .field-label-row {
+  display: flex;
+  min-height: 24px;
+  align-items: center;
+  line-height: 24px;
+}
+
+.download-options-grid .control-select.ant-select,
+.download-options-grid .field-block .ant-segmented {
+  align-self: start;
 }
 
 .command-row .ant-btn {
@@ -1722,7 +1975,6 @@ body {
 }
 
 .download-status-heading,
-.download-status-footer,
 .download-status-meta,
 .download-status-meta-row {
   display: flex;
@@ -1730,8 +1982,7 @@ body {
   min-width: 0;
 }
 
-.download-status-heading,
-.download-status-footer {
+.download-status-heading {
   justify-content: space-between;
   gap: 12px;
 }
@@ -1759,13 +2010,27 @@ body {
   gap: 12px;
 }
 
+.download-status-runtime.ant-typography {
+  flex: 1 1 auto;
+  overflow: hidden;
+  min-width: 72px;
+  color: #64748b;
+  font-size: 12px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
 .download-status-progress-summary {
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 7px;
-  min-width: 150px;
-  max-width: 45%;
+  flex: 0 0 136px;
+  width: 136px;
+  min-width: 136px;
+  max-width: 136px;
 }
 
 .download-status-meta .ant-typography {
@@ -1773,6 +2038,35 @@ body {
   min-width: 0;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.download-status-media-info {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.download-status-media-summary.ant-typography,
+.download-status-media-comparison.ant-typography {
+  display: inline-flex;
+  max-width: 100%;
+  min-width: 0;
+  align-items: center;
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.download-status-media-summary.ant-typography {
+  color: #475569;
+}
+
+.download-status-media-comparison.ant-typography {
+  color: #8a5a00;
 }
 
 .download-status-progress-row {
@@ -1790,14 +2084,6 @@ body {
   line-height: 1;
   text-align: right;
   font-variant-numeric: tabular-nums;
-}
-
-.download-status-metrics {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(118px, 1fr));
-  gap: 8px;
-  min-width: 0;
-  flex: 1;
 }
 
 .queue-card .ant-card-body {
@@ -1824,16 +2110,20 @@ body {
 
 .queue-title-row {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 8px;
   min-width: 0;
 }
 
 .queue-status-tag.ant-tag {
+  display: inline-flex;
   flex: 0 0 auto;
+  align-items: center;
+  min-height: 22px;
   margin-inline-end: 0;
   border-radius: 7px;
   font-weight: 650;
+  line-height: 20px;
 }
 
 .queue-status-tag.is-idle.ant-tag {
@@ -1880,6 +2170,7 @@ body {
   color: var(--ink);
   font-size: 14px;
   font-weight: 720;
+  line-height: 22px;
   overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
@@ -1895,12 +2186,21 @@ body {
 
 .queue-meta,
 .queue-runtime-meta,
-.queue-auth-format,
+.queue-media-meta,
+.queue-media-comparison,
 .queue-error {
   overflow: hidden;
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.queue-media-meta.ant-typography {
+  color: #475569;
+}
+
+.queue-media-comparison.ant-typography {
+  color: #8a5a00;
 }
 
 .queue-auth-row {
@@ -1912,10 +2212,15 @@ body {
 
 .queue-auth-tag.ant-tag {
   flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
   margin-inline-end: 0;
+  padding: 0 9px;
   border-radius: 7px;
   font-size: 12px;
   font-weight: 650;
+  line-height: 24px;
 }
 
 .queue-auth-tag.is-idle.ant-tag {
@@ -1949,8 +2254,44 @@ body {
   border-color: #ffa39e;
 }
 
+.queue-auth-tag.is-canceled.ant-tag {
+  color: #475569;
+  background: #f8fafc;
+  border-color: #e2e8f0;
+}
+
 .queue-auth-format.ant-typography {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  max-width: 100%;
+  height: 26px;
   min-width: 0;
+  padding: 0 9px;
+  overflow: hidden;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 24px;
+  white-space: nowrap;
+  background: #f8fafc;
+  border: 1px solid #dbeafe;
+  border-radius: 7px;
+}
+
+.queue-auth-format-prefix,
+.queue-auth-format-resolution {
+  flex: 0 0 auto;
+}
+
+.queue-auth-format-resolution {
+  color: var(--primary);
+  font-weight: 720;
+}
+
+.queue-auth-format-detail {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
 }
 
 .queue-auth-popover {
@@ -2025,6 +2366,24 @@ body {
   box-shadow: none;
 }
 
+.queue-remove-button.ant-btn {
+  width: 42px;
+  min-width: 42px;
+  height: 42px;
+  color: #64748b;
+  background: #ffffff;
+  border-color: #d8e0ea;
+  box-shadow: none;
+}
+
+.queue-remove-button.ant-btn:hover,
+.queue-remove-button.ant-btn:focus-visible {
+  color: #cf1322;
+  background: #fff1f0;
+  border-color: #ffccc7;
+  box-shadow: none;
+}
+
 .history-page-card .ant-card-body {
   padding: 0;
 }
@@ -2072,6 +2431,8 @@ body {
 
 .history-page-meta,
 .history-page-details .ant-typography,
+.history-page-media,
+.history-page-media-comparison,
 .history-page-error {
   font-size: 12px;
 }
@@ -2086,6 +2447,17 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.history-page-media.ant-typography,
+.history-page-media-comparison.ant-typography {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-page-media-comparison.ant-typography {
+  color: #8a5a00;
 }
 
 .history-page-error {
@@ -2152,29 +2524,6 @@ body {
   gap: 10px;
 }
 
-.metric {
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-  padding: 8px 10px;
-  background: #f7f9fc;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-}
-
-.metric .ant-typography-secondary {
-  font-size: 12px;
-}
-
-.metric .ant-typography-strong {
-  overflow: hidden;
-  color: var(--ink);
-  font-size: 14px;
-  line-height: 1.25;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .path-button {
   justify-content: flex-start;
   max-width: 100%;
@@ -2215,7 +2564,7 @@ body {
 
 .sidebar-dependency-popover-tools {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
   gap: 12px;
 }
 
@@ -2265,6 +2614,24 @@ body {
 
 .dependency-actions {
   padding-top: 2px;
+}
+
+.proxy-popover .ant-alert {
+  padding: 6px 8px;
+}
+
+.proxy-popover .ant-alert-message {
+  font-size: 12px;
+}
+
+.proxy-settings-form {
+  display: grid;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.proxy-mode-select {
+  width: 100%;
 }
 
 .error-banner .ant-alert-message {
@@ -2356,10 +2723,6 @@ body {
     grid-template-columns: 148px minmax(0, 1fr);
   }
 
-  .download-status-metrics {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .download-status-rail {
     grid-template-columns: 1fr;
   }
@@ -2429,14 +2792,31 @@ body {
     max-width: 240px;
   }
 
-  .download-status-heading,
-  .download-status-footer {
+  .download-status-heading {
     align-items: stretch;
     flex-direction: column;
   }
 
   .download-status-heading {
     align-items: flex-start;
+  }
+
+  .auth-probe-popover {
+    width: min(360px, calc(100vw - 32px));
+  }
+
+  .auth-probe-site-row {
+    grid-template-columns: 1fr;
+    gap: 5px;
+  }
+
+  .auth-probe-site-format {
+    justify-content: flex-start;
+  }
+
+  .auth-probe-format {
+    flex-wrap: wrap;
+    white-space: normal;
   }
 
   .download-status-meta-row {
@@ -2448,9 +2828,9 @@ body {
     max-width: 100%;
   }
 
-  .download-status-metrics {
-    width: 100%;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .download-status-runtime.ant-typography {
+    flex-basis: 100%;
+    text-align: left;
   }
 
   .download-status-open-button.ant-btn {
