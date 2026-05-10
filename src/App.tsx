@@ -119,6 +119,7 @@ import {
   statusTagColor,
 } from "./historyUtils";
 import {
+  formatMediaBytes,
   localMediaErrorTitle,
   localMediaSummary,
   mediaComparisonSummary,
@@ -244,6 +245,9 @@ type QueueItem = {
   phaseLabel?: string | null;
   speed?: string | null;
   eta?: string | null;
+  downloadedBytes?: number | null;
+  totalBytes?: number | null;
+  totalBytesEstimated?: boolean | null;
   outputPath?: string | null;
   localMedia?: LocalMediaInfo | null;
   mediaComparison?: MediaComparison | null;
@@ -1179,6 +1183,9 @@ export default function App() {
                   phaseLabel: null,
                   speed: null,
                   eta: null,
+                  downloadedBytes: null,
+                  totalBytes: null,
+                  totalBytesEstimated: null,
                   error: null,
                 }
               : candidate,
@@ -1262,6 +1269,9 @@ export default function App() {
               phaseLabel: null,
               speed: null,
               eta: null,
+              downloadedBytes: null,
+              totalBytes: null,
+              totalBytesEstimated: null,
               outputPath: null,
               localMedia: null,
               mediaComparison: null,
@@ -1366,6 +1376,9 @@ export default function App() {
               phaseLabel: null,
               speed: null,
               eta: null,
+              downloadedBytes: null,
+              totalBytes: null,
+              totalBytesEstimated: null,
             }
           : item,
       ),
@@ -1444,6 +1457,13 @@ export default function App() {
               phaseLabel: shouldResumeProgress ? candidate.phaseLabel : null,
               speed: null,
               eta: null,
+              downloadedBytes: shouldResumeProgress
+                ? candidate.downloadedBytes
+                : null,
+              totalBytes: shouldResumeProgress ? candidate.totalBytes : null,
+              totalBytesEstimated: shouldResumeProgress
+                ? candidate.totalBytesEstimated
+                : null,
               localMedia: null,
               mediaComparison: null,
               error: null,
@@ -1481,6 +1501,9 @@ export default function App() {
                 progress: 0,
                 phase: null,
                 phaseLabel: null,
+                downloadedBytes: null,
+                totalBytes: null,
+                totalBytesEstimated: null,
                 error: nextError,
               }
             : candidate,
@@ -1808,6 +1831,17 @@ export default function App() {
               phaseLabel: event.phaseLabel ?? null,
               speed: event.speed ?? null,
               eta: event.eta ?? null,
+              downloadedBytes:
+                event.downloadedBytes ??
+                (event.status === "canceled" ? null : item.downloadedBytes ?? null),
+              totalBytes:
+                event.totalBytes ??
+                (event.status === "canceled" ? null : item.totalBytes ?? null),
+              totalBytesEstimated:
+                event.totalBytesEstimated ??
+                (event.status === "canceled"
+                  ? null
+                  : item.totalBytesEstimated ?? null),
               outputPath: event.outputPath ?? item.outputPath ?? null,
               localMedia: event.localMedia ?? item.localMedia ?? null,
               mediaComparison:
@@ -1869,6 +1903,9 @@ export default function App() {
               progress: 0,
               phase: null,
               phaseLabel: null,
+              downloadedBytes: null,
+              totalBytes: null,
+              totalBytesEstimated: null,
               localMedia: null,
               mediaComparison: null,
               error: null,
@@ -2339,6 +2376,7 @@ export default function App() {
                   const comparisonText = mediaComparisonSummary(
                     item.mediaComparison,
                   );
+                  const downloadSizeText = queueDownloadSizeText(item);
 
                   return (
                     <List.Item className="queue-item" key={item.id}>
@@ -2402,7 +2440,14 @@ export default function App() {
                       />
                     </div>
                     <div className="queue-item-side">
-                      <Text strong>{Math.round(item.progress)}%</Text>
+                      <div className="queue-progress-value">
+                        <Text strong>{Math.round(item.progress)}%</Text>
+                        {downloadSizeText ? (
+                          <Text className="queue-size-meta" type="secondary">
+                            {downloadSizeText}
+                          </Text>
+                        ) : null}
+                      </div>
                       <Space size={8} wrap>
                         {item.outputPath ? (
                           <Tooltip title="打开文件位置">
@@ -3829,6 +3874,9 @@ function queueItemFromParsed(item: BatchParseItem, browser: BrowserKind): QueueI
     phaseLabel: null,
     speed: null,
     eta: null,
+    downloadedBytes: null,
+    totalBytes: null,
+    totalBytesEstimated: null,
     outputPath: null,
     localMedia: null,
     mediaComparison: null,
@@ -4268,6 +4316,45 @@ function queueRuntimeMeta(item: QueueItem) {
   ].filter(Boolean);
 
   return parts.length ? parts.join(" · ") : null;
+}
+
+function queueDownloadSizeText(
+  item: Pick<
+    QueueItem,
+    "downloadedBytes" | "totalBytes" | "totalBytesEstimated"
+  >,
+) {
+  const downloadedBytes = normalizedDownloadBytes(item.downloadedBytes, true);
+  const totalBytes = normalizedDownloadBytes(item.totalBytes, false);
+
+  if (downloadedBytes === null && totalBytes === null) {
+    return null;
+  }
+
+  const downloadedText =
+    downloadedBytes === null ? "-" : formatDownloadBytes(downloadedBytes);
+  const totalText =
+    totalBytes === null
+      ? "-"
+      : `${item.totalBytesEstimated ? "约" : ""}${formatDownloadBytes(totalBytes)}`;
+
+  return `${downloadedText} / ${totalText}`;
+}
+
+function normalizedDownloadBytes(value?: number | null, allowZero = false) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+
+  if (value > 0 || (allowZero && value === 0)) {
+    return value;
+  }
+
+  return null;
+}
+
+function formatDownloadBytes(bytes: number) {
+  return formatMediaBytes(bytes) ?? "0B";
 }
 
 function isInvalidQueueAfterCleanup(item: QueueItem) {

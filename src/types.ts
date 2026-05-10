@@ -168,6 +168,9 @@ export interface ProgressEvent {
   phaseLabel?: string | null;
   speed?: string | null;
   eta?: string | null;
+  downloadedBytes?: number | null;
+  totalBytes?: number | null;
+  totalBytesEstimated?: boolean | null;
   line?: string | null;
   outputPath?: string | null;
   localMedia?: LocalMediaInfo | null;
@@ -189,6 +192,7 @@ export interface LocalMediaInfo {
   height?: number | null;
   videoCodec?: string | null;
   audioCodec?: string | null;
+  fileSizeBytes?: number | null;
   probedAt?: string | null;
   error?: string | null;
 }

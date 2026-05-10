@@ -352,6 +352,9 @@ struct ProgressEvent {
     phase_label: Option<String>,
     speed: Option<String>,
     eta: Option<String>,
+    downloaded_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+    total_bytes_estimated: Option<bool>,
     line: Option<String>,
     output_path: Option<String>,
     local_media: Option<LocalMediaInfo>,
@@ -384,6 +387,7 @@ struct LocalMediaInfo {
     height: Option<u64>,
     video_codec: Option<String>,
     audio_codec: Option<String>,
+    file_size_bytes: Option<u64>,
     probed_at: Option<String>,
     error: Option<String>,
 }
@@ -439,6 +443,9 @@ struct ParsedProgress {
     progress: f64,
     speed: Option<String>,
     eta: Option<String>,
+    downloaded_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+    total_bytes_estimate: Option<u64>,
     media_kind: ProgressMediaKind,
 }
 
@@ -454,6 +461,16 @@ enum ProgressMediaKind {
 struct ProgressSnapshot {
     progress: f64,
     phase: DownloadPhase,
+    video_bytes: ProgressBytes,
+    audio_bytes: ProgressBytes,
+    media_bytes: ProgressBytes,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProgressBytes {
+    downloaded: Option<u64>,
+    total: Option<u64>,
+    total_estimated: bool,
 }
 
 impl Default for ProgressSnapshot {
@@ -461,6 +478,60 @@ impl Default for ProgressSnapshot {
         Self {
             progress: 0.0,
             phase: DownloadPhase::DownloadingMedia,
+            video_bytes: ProgressBytes::default(),
+            audio_bytes: ProgressBytes::default(),
+            media_bytes: ProgressBytes::default(),
+        }
+    }
+}
+
+impl ProgressSnapshot {
+    fn current_bytes(self) -> ProgressBytes {
+        if self.media_bytes.downloaded.is_some() || self.media_bytes.total.is_some() {
+            return self.media_bytes;
+        }
+
+        let has_video = self.video_bytes.downloaded.is_some() || self.video_bytes.total.is_some();
+        let has_audio = self.audio_bytes.downloaded.is_some() || self.audio_bytes.total.is_some();
+
+        match (has_video, has_audio) {
+            (true, true) => self.video_bytes.combine(self.audio_bytes),
+            (true, false) => self.video_bytes,
+            (false, true) => self.audio_bytes,
+            (false, false) => ProgressBytes::default(),
+        }
+    }
+}
+
+impl ProgressBytes {
+    fn from_progress(parsed: &ParsedProgress) -> Self {
+        let total = parsed.total_bytes.or(parsed.total_bytes_estimate);
+
+        Self {
+            downloaded: parsed.downloaded_bytes,
+            total,
+            total_estimated: parsed.total_bytes.is_none() && parsed.total_bytes_estimate.is_some(),
+        }
+    }
+
+    fn merge_progress(&mut self, parsed: &ParsedProgress) {
+        let next = Self::from_progress(parsed);
+        self.downloaded = max_optional_u64(self.downloaded, next.downloaded);
+
+        if parsed.total_bytes.is_some() {
+            self.total = max_optional_u64(self.total, parsed.total_bytes);
+            self.total_estimated = false;
+        } else if self.total.is_none() || self.total_estimated {
+            self.total = max_optional_u64(self.total, parsed.total_bytes_estimate);
+            self.total_estimated = self.total.is_some();
+        }
+    }
+
+    fn combine(self, other: Self) -> Self {
+        Self {
+            downloaded: sum_optional_u64(self.downloaded, other.downloaded),
+            total: sum_optional_u64(self.total, other.total),
+            total_estimated: self.total_estimated || other.total_estimated,
         }
     }
 }
@@ -794,7 +865,7 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
             .arg("--progress-delta")
             .arg("0.5")
             .arg("--progress-template")
-            .arg("download:VD_PROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(info.vcodec|)s|%(info.acodec|)s|%(info.format_id|)s")
+            .arg("download:VD_PROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s|%(info.vcodec|)s|%(info.acodec|)s|%(info.format_id|)s|%(progress.downloaded_bytes|)s|%(progress.total_bytes|)s|%(progress.total_bytes_estimate|)s")
             .arg("--progress-template")
             .arg("postprocess:VD_POSTPROCESS:%(progress.status|)s")
             .arg("--no-playlist")
@@ -911,6 +982,8 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
 
                 if let Some(parsed) = parse_progress_line(&line) {
                     let snapshot = update_progress_snapshot(&progress_for_stderr, &parsed);
+                    let (downloaded_bytes, total_bytes, total_bytes_estimated) =
+                        progress_event_bytes(snapshot);
                     let _ = app_for_stderr.emit(
                         "download-progress",
                         ProgressEvent {
@@ -921,6 +994,9 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                             phase_label: Some(snapshot.phase.label().to_string()),
                             speed: parsed.speed,
                             eta: parsed.eta,
+                            downloaded_bytes,
+                            total_bytes,
+                            total_bytes_estimated,
                             line: Some(line.trim().to_string()),
                             output_path: None,
                             local_media: None,
@@ -930,6 +1006,8 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                     );
                 } else if is_merge_progress_line(&line) {
                     let snapshot = update_merge_snapshot(&progress_for_stderr);
+                    let (downloaded_bytes, total_bytes, total_bytes_estimated) =
+                        progress_event_bytes(snapshot);
                     let _ = app_for_stderr.emit(
                         "download-progress",
                         ProgressEvent {
@@ -940,6 +1018,9 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                             phase_label: Some(snapshot.phase.label().to_string()),
                             speed: None,
                             eta: None,
+                            downloaded_bytes,
+                            total_bytes,
+                            total_bytes_estimated,
                             line: Some(line.trim().to_string()),
                             output_path: None,
                             local_media: None,
@@ -969,6 +1050,8 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                 if let Some(parsed) = parse_progress_line(&line) {
                     let snapshot = update_progress_snapshot(&progress_for_stdout, &parsed);
                     progress = snapshot.progress;
+                    let (downloaded_bytes, total_bytes, total_bytes_estimated) =
+                        progress_event_bytes(snapshot);
                     let _ = app_for_stdout.emit(
                         "download-progress",
                         ProgressEvent {
@@ -979,6 +1062,9 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                             phase_label: Some(snapshot.phase.label().to_string()),
                             speed: parsed.speed,
                             eta: parsed.eta,
+                            downloaded_bytes,
+                            total_bytes,
+                            total_bytes_estimated,
                             line: Some(line),
                             output_path: output_path.clone(),
                             local_media: None,
@@ -989,6 +1075,8 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                 } else if is_merge_progress_line(&line) {
                     let snapshot = update_merge_snapshot(&progress_for_stdout);
                     progress = snapshot.progress;
+                    let (downloaded_bytes, total_bytes, total_bytes_estimated) =
+                        progress_event_bytes(snapshot);
                     let _ = app_for_stdout.emit(
                         "download-progress",
                         ProgressEvent {
@@ -999,6 +1087,9 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                             phase_label: Some(snapshot.phase.label().to_string()),
                             speed: None,
                             eta: None,
+                            downloaded_bytes,
+                            total_bytes,
+                            total_bytes_estimated,
                             line: Some(line),
                             output_path: output_path.clone(),
                             local_media: None,
@@ -1070,6 +1161,21 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
             } else {
                 (None, None)
             };
+            let (snapshot_downloaded_bytes, snapshot_total_bytes, snapshot_total_bytes_estimated) =
+                shared_progress
+                    .lock()
+                    .map(|snapshot| progress_event_bytes(*snapshot))
+                    .unwrap_or((None, None, None));
+            let file_size_bytes = local_media
+                .as_ref()
+                .and_then(|media| media.file_size_bytes);
+            let downloaded_bytes = file_size_bytes.or(snapshot_downloaded_bytes);
+            let total_bytes = file_size_bytes.or(snapshot_total_bytes);
+            let total_bytes_estimated = if file_size_bytes.is_some() {
+                Some(false)
+            } else {
+                snapshot_total_bytes_estimated
+            };
 
             let _ = app_for_stdout.emit(
                 "download-progress",
@@ -1081,6 +1187,9 @@ async fn start_download(app: AppHandle, request: DownloadRequest) -> Result<Stri
                     phase_label: final_phase.map(|phase| phase.label().to_string()),
                     speed: None,
                     eta: None,
+                    downloaded_bytes,
+                    total_bytes,
+                    total_bytes_estimated,
                     line: None,
                     output_path: output_path.clone(),
                     local_media: local_media.clone(),
@@ -1160,6 +1269,9 @@ async fn cancel_download(app: AppHandle, task_id: String) -> Result<(), String> 
                 phase_label: None,
                 speed: None,
                 eta: None,
+                downloaded_bytes: None,
+                total_bytes: None,
+                total_bytes_estimated: None,
                 line: None,
                 output_path: None,
                 local_media: None,
@@ -1202,6 +1314,9 @@ async fn pause_download(app: AppHandle, task_id: String) -> Result<(), String> {
                     phase_label: None,
                     speed: None,
                     eta: None,
+                    downloaded_bytes: None,
+                    total_bytes: None,
+                    total_bytes_estimated: None,
                     line: None,
                     output_path: None,
                     local_media: None,
@@ -1233,6 +1348,9 @@ async fn pause_download(app: AppHandle, task_id: String) -> Result<(), String> {
                 phase_label: None,
                 speed: None,
                 eta: None,
+                downloaded_bytes: None,
+                total_bytes: None,
+                total_bytes_estimated: None,
                 line: None,
                 output_path: None,
                 local_media: None,
@@ -2963,6 +3081,7 @@ fn probe_local_media(state: &AppState, ffmpeg_path: &Path, media_path: &Path) ->
             ..Default::default()
         };
     }
+    let file_size_bytes = local_file_size(media_path);
 
     let mut command = Command::new(ffprobe_path_from_ffmpeg(ffmpeg_path));
     apply_tool_env(state, &mut command);
@@ -2979,6 +3098,7 @@ fn probe_local_media(state: &AppState, ffmpeg_path: &Path, media_path: &Path) ->
         Ok(output) => output,
         Err(error) => {
             return LocalMediaInfo {
+                file_size_bytes,
                 probed_at,
                 error: Some(error),
                 ..Default::default()
@@ -2989,6 +3109,7 @@ fn probe_local_media(state: &AppState, ffmpeg_path: &Path, media_path: &Path) ->
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return LocalMediaInfo {
+            file_size_bytes,
             probed_at,
             error: Some(if message.is_empty() {
                 "ffprobe 未返回可用媒体信息。".to_string()
@@ -3003,6 +3124,7 @@ fn probe_local_media(state: &AppState, ffmpeg_path: &Path, media_path: &Path) ->
         Ok(json) => json,
         Err(error) => {
             return LocalMediaInfo {
+                file_size_bytes,
                 probed_at,
                 error: Some(format!("解析 ffprobe JSON 失败：{error}")),
                 ..Default::default()
@@ -3010,7 +3132,11 @@ fn probe_local_media(state: &AppState, ffmpeg_path: &Path, media_path: &Path) ->
         }
     };
 
-    parse_local_media_info(&json, probed_at)
+    parse_local_media_info(&json, probed_at, file_size_bytes)
+}
+
+fn local_file_size(media_path: &Path) -> Option<u64> {
+    fs::metadata(media_path).ok().map(|metadata| metadata.len())
 }
 
 fn ffprobe_path_from_ffmpeg(ffmpeg_path: &Path) -> PathBuf {
@@ -3030,7 +3156,11 @@ fn ffprobe_path_from_ffmpeg(ffmpeg_path: &Path) -> PathBuf {
     PathBuf::from(executable_name)
 }
 
-fn parse_local_media_info(json: &Value, probed_at: Option<String>) -> LocalMediaInfo {
+fn parse_local_media_info(
+    json: &Value,
+    probed_at: Option<String>,
+    file_size_bytes: Option<u64>,
+) -> LocalMediaInfo {
     let streams = json
         .get("streams")
         .and_then(Value::as_array)
@@ -3058,6 +3188,7 @@ fn parse_local_media_info(json: &Value, probed_at: Option<String>) -> LocalMedia
         height: video_stream.and_then(|stream| u64_field(stream, "height")),
         video_codec: video_stream.and_then(|stream| codec_field(stream, "codec_name")),
         audio_codec: audio_stream.and_then(|stream| codec_field(stream, "codec_name")),
+        file_size_bytes,
         probed_at,
         error: None,
     }
@@ -3534,11 +3665,36 @@ fn update_progress_snapshot(
             if should_update_phase {
                 snapshot.phase = phase;
             }
+            match parsed.media_kind {
+                ProgressMediaKind::Video => snapshot.video_bytes.merge_progress(parsed),
+                ProgressMediaKind::Audio => snapshot.audio_bytes.merge_progress(parsed),
+                ProgressMediaKind::Media | ProgressMediaKind::Unknown => {
+                    snapshot.media_bytes.merge_progress(parsed)
+                }
+            }
             *snapshot
         })
         .unwrap_or(ProgressSnapshot {
             progress: mapped,
             phase,
+            video_bytes: if parsed.media_kind == ProgressMediaKind::Video {
+                ProgressBytes::from_progress(parsed)
+            } else {
+                ProgressBytes::default()
+            },
+            audio_bytes: if parsed.media_kind == ProgressMediaKind::Audio {
+                ProgressBytes::from_progress(parsed)
+            } else {
+                ProgressBytes::default()
+            },
+            media_bytes: if matches!(
+                parsed.media_kind,
+                ProgressMediaKind::Media | ProgressMediaKind::Unknown
+            ) {
+                ProgressBytes::from_progress(parsed)
+            } else {
+                ProgressBytes::default()
+            },
         })
 }
 
@@ -3553,6 +3709,7 @@ fn update_merge_snapshot(progress: &Arc<Mutex<ProgressSnapshot>>) -> ProgressSna
         .unwrap_or(ProgressSnapshot {
             progress: 99.0,
             phase: DownloadPhase::Merging,
+            ..Default::default()
         })
 }
 
@@ -3564,6 +3721,31 @@ fn map_download_progress(progress: f64, media_kind: ProgressMediaKind) -> f64 {
         ProgressMediaKind::Audio => 50.0 + progress * 0.49,
         ProgressMediaKind::Media | ProgressMediaKind::Unknown => progress * 0.99,
     }
+}
+
+fn max_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn sum_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn progress_event_bytes(snapshot: ProgressSnapshot) -> (Option<u64>, Option<u64>, Option<bool>) {
+    let bytes = snapshot.current_bytes();
+    (
+        bytes.downloaded,
+        bytes.total,
+        bytes.total.map(|_| bytes.total_estimated),
+    )
 }
 
 fn progress_phase(media_kind: ProgressMediaKind) -> DownloadPhase {
@@ -3620,6 +3802,9 @@ fn parse_progress_line(line: &str) -> Option<ParsedProgress> {
         progress,
         speed,
         eta,
+        downloaded_bytes: None,
+        total_bytes: None,
+        total_bytes_estimate: None,
         media_kind: ProgressMediaKind::Unknown,
     })
 }
@@ -3632,11 +3817,17 @@ fn parse_machine_progress_line(line: &str) -> Option<ParsedProgress> {
     let vcodec = fields.next().and_then(normalize_progress_value);
     let acodec = fields.next().and_then(normalize_progress_value);
     let _format_id = fields.next().and_then(normalize_progress_value);
+    let downloaded_bytes = fields.next().and_then(parse_u64_progress_value);
+    let total_bytes = fields.next().and_then(parse_u64_progress_value);
+    let total_bytes_estimate = fields.next().and_then(parse_u64_progress_value);
 
     Some(ParsedProgress {
         progress,
         speed,
         eta,
+        downloaded_bytes,
+        total_bytes,
+        total_bytes_estimate,
         media_kind: progress_media_kind(vcodec.as_deref(), acodec.as_deref()),
     })
 }
@@ -3671,6 +3862,17 @@ fn parse_percent_value(value: &str) -> Option<f64> {
     }
 
     value.parse::<f64>().ok()
+}
+
+fn parse_u64_progress_value(value: &str) -> Option<u64> {
+    let value = normalize_progress_value(value)?;
+
+    value.parse::<u64>().ok().or_else(|| {
+        value
+            .parse::<f64>()
+            .ok()
+            .map(|value| value.max(0.0).round() as u64)
+    })
 }
 
 fn normalize_eta_value(value: &str) -> Option<String> {
@@ -3789,20 +3991,40 @@ mod tests {
     #[test]
     fn parses_machine_progress_line() {
         let parsed =
-            parse_progress_line("VD_PROGRESS: 12.3%|8.4MiB/s|00:42|h264|none|137").unwrap();
+            parse_progress_line("VD_PROGRESS: 12.3%|8.4MiB/s|00:42|h264|none|137|123456|1000000|")
+                .unwrap();
 
         assert_eq!(parsed.progress, 12.3);
         assert_eq!(parsed.speed.as_deref(), Some("8.8MB/s"));
         assert_eq!(parsed.eta.as_deref(), Some("00:42"));
+        assert_eq!(parsed.downloaded_bytes, Some(123_456));
+        assert_eq!(parsed.total_bytes, Some(1_000_000));
+        assert_eq!(parsed.total_bytes_estimate, None);
         assert_eq!(parsed.media_kind, ProgressMediaKind::Video);
 
-        let parsed =
-            parse_progress_line("VD_PROGRESS: 40%|Unknown B/s|Unknown ETA|none|opus|251").unwrap();
+        let parsed = parse_progress_line(
+            "VD_PROGRESS: 40%|Unknown B/s|Unknown ETA|none|opus|251|400000||900000",
+        )
+        .unwrap();
 
         assert_eq!(parsed.progress, 40.0);
         assert_eq!(parsed.speed, None);
         assert_eq!(parsed.eta, None);
+        assert_eq!(parsed.downloaded_bytes, Some(400_000));
+        assert_eq!(parsed.total_bytes, None);
+        assert_eq!(parsed.total_bytes_estimate, Some(900_000));
         assert_eq!(parsed.media_kind, ProgressMediaKind::Audio);
+    }
+
+    #[test]
+    fn parses_machine_progress_line_with_unknown_sizes() {
+        let parsed =
+            parse_progress_line("VD_PROGRESS: 5%|N/A|N/A|h264|none|137|N/A|Unknown|").unwrap();
+
+        assert_eq!(parsed.progress, 5.0);
+        assert_eq!(parsed.downloaded_bytes, None);
+        assert_eq!(parsed.total_bytes, None);
+        assert_eq!(parsed.total_bytes_estimate, None);
     }
 
     #[test]
@@ -3855,6 +4077,7 @@ mod tests {
         let progress = Arc::new(Mutex::new(ProgressSnapshot {
             progress: 74.5,
             phase: DownloadPhase::DownloadingAudio,
+            ..Default::default()
         }));
         let snapshot = update_merge_snapshot(&progress);
 
@@ -3869,12 +4092,18 @@ mod tests {
             progress: 100.0,
             speed: None,
             eta: None,
+            downloaded_bytes: None,
+            total_bytes: None,
+            total_bytes_estimate: None,
             media_kind: ProgressMediaKind::Video,
         };
         let audio_start = ParsedProgress {
             progress: 0.0,
             speed: None,
             eta: None,
+            downloaded_bytes: None,
+            total_bytes: None,
+            total_bytes_estimate: None,
             media_kind: ProgressMediaKind::Audio,
         };
 
@@ -3888,12 +4117,46 @@ mod tests {
             progress: 80.0,
             speed: None,
             eta: None,
+            downloaded_bytes: None,
+            total_bytes: None,
+            total_bytes_estimate: None,
             media_kind: ProgressMediaKind::Video,
         };
         let snapshot = update_progress_snapshot(&progress, &stale_video);
 
         assert_eq!(snapshot.progress, 50.0);
         assert_eq!(snapshot.phase, DownloadPhase::DownloadingAudio);
+    }
+
+    #[test]
+    fn progress_snapshot_accumulates_split_stream_sizes() {
+        let progress = Arc::new(Mutex::new(ProgressSnapshot::default()));
+        let video = ParsedProgress {
+            progress: 100.0,
+            speed: None,
+            eta: None,
+            downloaded_bytes: Some(120),
+            total_bytes: Some(120),
+            total_bytes_estimate: None,
+            media_kind: ProgressMediaKind::Video,
+        };
+        let audio = ParsedProgress {
+            progress: 50.0,
+            speed: None,
+            eta: None,
+            downloaded_bytes: Some(20),
+            total_bytes: None,
+            total_bytes_estimate: Some(40),
+            media_kind: ProgressMediaKind::Audio,
+        };
+
+        update_progress_snapshot(&progress, &video);
+        let snapshot = update_progress_snapshot(&progress, &audio);
+        let (downloaded_bytes, total_bytes, total_bytes_estimated) = progress_event_bytes(snapshot);
+
+        assert_eq!(downloaded_bytes, Some(140));
+        assert_eq!(total_bytes, Some(160));
+        assert_eq!(total_bytes_estimated, Some(true));
     }
 
     #[test]
@@ -4152,15 +4415,26 @@ mod tests {
             }
         });
 
-        let media = parse_local_media_info(&json, Some("123".to_string()));
+        let media = parse_local_media_info(&json, Some("123".to_string()), Some(987_654));
 
         assert_eq!(media.duration, Some(481.2));
         assert_eq!(media.width, Some(1920));
         assert_eq!(media.height, Some(1080));
         assert_eq!(media.video_codec.as_deref(), Some("h264"));
         assert_eq!(media.audio_codec.as_deref(), Some("aac"));
+        assert_eq!(media.file_size_bytes, Some(987_654));
         assert_eq!(media.probed_at.as_deref(), Some("123"));
         assert_eq!(media.error, None);
+    }
+
+    #[test]
+    fn reads_local_file_size_without_ffprobe() {
+        let path = env::temp_dir().join(format!("video-downloader-size-test-{}", uuid_like_id()));
+        fs::write(&path, [1_u8, 2, 3, 4, 5]).unwrap();
+
+        assert_eq!(local_file_size(&path), Some(5));
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -4182,7 +4456,7 @@ mod tests {
             ]
         });
 
-        let media = parse_local_media_info(&json, None);
+        let media = parse_local_media_info(&json, None, None);
 
         assert_eq!(media.duration, Some(302.0));
         assert_eq!(media.width, Some(1280));

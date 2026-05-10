@@ -309,6 +309,9 @@ export async function cancelDownload(taskId: string): Promise<void> {
       taskId,
       status: "canceled",
       progress: 0,
+      downloadedBytes: null,
+      totalBytes: null,
+      totalBytesEstimated: null,
     });
     return;
   }
@@ -327,6 +330,9 @@ export async function pauseDownload(taskId: string): Promise<void> {
       taskId,
       status: "paused",
       progress: mockProgress.get(taskId) ?? 0,
+      downloadedBytes: null,
+      totalBytes: null,
+      totalBytesEstimated: null,
     });
     return;
   }
@@ -593,6 +599,9 @@ function runMockDownload(taskId: string) {
       phaseLabel,
       speed: progress >= 100 ? null : "8.4MB/s",
       eta: progress >= 100 ? null : "00:12",
+      downloadedBytes: Math.round((progress / 100) * 185_000_000),
+      totalBytes: 185_000_000,
+      totalBytesEstimated: progress >= 100 ? false : true,
       outputPath:
         progress >= 100
           ? `${MOCK_DOWNLOAD_DIR}/sample-video.mp4`
@@ -605,6 +614,7 @@ function runMockDownload(taskId: string) {
               height: 1080,
               videoCodec: "h264",
               audioCodec: "aac",
+              fileSizeBytes: 185_000_000,
               probedAt: String(Math.floor(Date.now() / 1000)),
               error: null,
             }

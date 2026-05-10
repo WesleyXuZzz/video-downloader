@@ -12,6 +12,7 @@ export function localMediaSummary(
     media.duration ? formatMediaDuration(media.duration) : null,
     localMediaResolution(media),
     localMediaCodecs(media),
+    formatMediaBytes(media.fileSizeBytes),
   ].filter(Boolean);
 
   if (!parts.length) {
@@ -53,6 +54,30 @@ export function formatMediaDuration(duration?: number | null) {
   }
 
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+export function formatMediaBytes(bytes?: number | null) {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= 0) {
+    return null;
+  }
+
+  if (bytes >= 1_000_000_000) {
+    return `${trimMediaNumber(bytes / 1_000_000_000)}GB`;
+  }
+
+  if (bytes >= 1_000_000) {
+    return `${trimMediaNumber(bytes / 1_000_000)}MB`;
+  }
+
+  if (bytes >= 1_000) {
+    return `${trimMediaNumber(bytes / 1_000)}KB`;
+  }
+
+  return `${Math.round(bytes)}B`;
+}
+
+function trimMediaNumber(value: number) {
+  return (value >= 100 ? value.toFixed(0) : value.toFixed(1)).replace(/\.0$/, "");
 }
 
 function localMediaResolution(media: LocalMediaInfo) {

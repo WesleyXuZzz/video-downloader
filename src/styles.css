@@ -2367,6 +2367,24 @@ body {
   gap: 8px;
 }
 
+.queue-progress-value {
+  display: grid;
+  justify-items: end;
+  gap: 2px;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.queue-size-meta.ant-typography {
+  max-width: 132px;
+  overflow: hidden;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .queue-danger-button.ant-btn {
   width: 42px;
   min-width: 42px;
@@ -2798,6 +2816,10 @@ body {
 
   .queue-item-side {
     min-width: 0;
+    justify-items: start;
+  }
+
+  .queue-progress-value {
     justify-items: start;
   }
 
